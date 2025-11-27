@@ -169,10 +169,12 @@ class TaskNotificationServer {
   async sendTaskNotification(task) {
     const notification = new apn.Notification();
     
-    const title = `📋 ${task.title}`;
-    let body = task.description || 'Task reminder';
+    // Use custom title/body if provided, otherwise default to task-based
+    const title = task.notificationTitle || `📋 ${task.title}`;
+    let body = task.notificationBody || task.description || 'Reminder';
     
-    if (task.dueDate) {
+    // Only add due date info if no custom body is provided
+    if (!task.notificationBody && task.dueDate) {
       const dueDate = new Date(task.dueDate);
       const now = new Date();
       const hoursUntilDue = Math.round((dueDate - now) / (1000 * 60 * 60));
@@ -212,14 +214,22 @@ class TaskNotificationServer {
   async sendOverdueNotification(task) {
     const notification = new apn.Notification();
     
-    const title = `⚠️ Overdue: ${task.title}`;
-    let body = task.description || 'This task is overdue';
+    // Use custom overdue title/body if provided
+    let title = task.overdueNotificationTitle || `⚠️ Overdue: ${task.title}`;
+    let body = task.overdueNotificationBody || task.description || 'This is overdue';
     
-    if (task.dueDate) {
+    // Only add overdue calculation if no custom body is provided
+    if (!task.overdueNotificationBody && task.dueDate) {
       const dueDate = new Date(task.dueDate);
       const now = new Date();
-      const daysOverdue = Math.round((now - dueDate) / (1000 * 60 * 60 * 24));
-      body = `${task.description || 'Task'} - ${daysOverdue} day${daysOverdue > 1 ? 's' : ''} overdue`;
+      // Fix: Use Math.ceil and handle timezone properly
+      const daysOverdue = Math.ceil((now.getTime() - dueDate.getTime()) / (1000 * 60 * 60 * 24));
+      
+      if (daysOverdue === 1) {
+        body = `${task.description || 'Task'} - 1 day overdue`;
+      } else {
+        body = `${task.description || 'Task'} - ${daysOverdue} days overdue`;
+      }
     }
     
     notification.alert = { title, body };
@@ -335,6 +345,35 @@ app.post('/sync-tasks', (req, res) => {
   res.json({ success: true, message: 'Tasks synced' });
 });
 
+// Generic notification endpoint for any type of notification
+app.post('/send-notification', async (req, res) => {
+  const { title, body, sound = 'default', badge = 1, payload = {}, deviceToken = null } = req.body;
+  
+  if (!title || !body) {
+    return res.status(400).json({ error: 'Title and body required' });
+  }
+  
+  const notification = new apn.Notification();
+  notification.alert = { title, body };
+  notification.sound = sound;
+  notification.badge = badge;
+  notification.topic = 'com.aurora.es.app';
+  notification.payload = payload;
+
+  const tokens = deviceToken ? [deviceToken] : server.deviceTokens.map(d => d.token);
+  
+  try {
+    for (const token of tokens) {
+      await apnProvider.send(notification, token);
+    }
+    console.log(`📤 Sent custom notification: "${title}"`);
+    res.json({ success: true, message: 'Notification sent' });
+  } catch (error) {
+    console.error('Error sending custom notification:', error);
+    res.status(500).json({ error: 'Failed to send notification' });
+  }
+});
+
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy', 
@@ -357,11 +396,12 @@ app.post('/debug-register', (req, res) => {
 
 // Start HTTP server
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 Task Notification API running on http://0.0.0.0:${PORT}`);
+  console.log(`🚀 Notification API running on http://0.0.0.0:${PORT}`);
   console.log('📱 Endpoints:');
   console.log(`   POST /register-device - Register device token`);
   console.log(`   POST /send-test - Send test notification`);
-  console.log(`   POST /sync-tasks - Sync tasks for notifications`);
+  console.log(`   POST /send-notification - Send custom notification`);
+  console.log(`   POST /sync-tasks - Sync tasks/reminders for notifications`);
   console.log(`   GET  /health - Check server status`);
 });
 
