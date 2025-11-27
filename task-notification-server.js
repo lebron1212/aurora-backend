@@ -120,6 +120,11 @@ class TaskNotificationServer {
     
     console.log(`⏰ Checking ${tasks.length} total tasks...`);
     
+    // NUCLEAR SPAM PREVENTION: Global notification cooldown per title
+    if (!this.notificationCooldowns) {
+      this.notificationCooldowns = new Map();
+    }
+    
     // Find tasks that need reminders (check ALL tasks, not deduplicated)
     const tasksToRemind = tasks.filter(task => {
       return (
@@ -144,7 +149,17 @@ class TaskNotificationServer {
     console.log(`⏰ Found ${uniqueReminders.length} unique reminder tasks (from ${tasksToRemind.length} total)`);
 
     for (const task of uniqueReminders) {
+      // Check global cooldown
+      const lastGlobalNotification = this.notificationCooldowns.get(task.title) || 0;
+      const fiveMinutesAgo = now - (5 * 60 * 1000); // 5-minute global cooldown
+      
+      if (lastGlobalNotification > fiveMinutesAgo) {
+        console.log(`🚫 BLOCKED: "${task.title}" is in global cooldown (last sent: ${lastGlobalNotification})`);
+        continue;
+      }
+      
       await this.sendTaskNotification(task);
+      this.notificationCooldowns.set(task.title, now);
       
       // Update ALL matching tasks in the full list
       tasks.forEach(t => {
@@ -158,7 +173,7 @@ class TaskNotificationServer {
       });
     }
 
-    // Check for overdue tasks - but check lastOverdueNotification FIRST
+    // Check for overdue tasks - but check BOTH file and global cooldown
     const overdueTasks = tasks.filter(task => {
       return (
         task.dueDate &&
@@ -182,25 +197,35 @@ class TaskNotificationServer {
     console.log(`⚠️ Found ${overdueGroups.size} unique overdue task groups`);
 
     for (const [title, taskGroup] of overdueGroups) {
-      // Use the first task to check notification status
+      // Check GLOBAL cooldown first (nuclear spam prevention)
+      const lastGlobalNotification = this.notificationCooldowns.get(title) || 0;
+      const oneHourAgo = now - (1 * 60 * 60 * 1000); // 1-hour global cooldown for overdue
+      
+      if (lastGlobalNotification > oneHourAgo) {
+        console.log(`🚫 GLOBAL BLOCK: "${title}" sent ${Math.round((now - lastGlobalNotification) / 60000)} minutes ago`);
+        continue;
+      }
+      
+      // Use the first task to check file notification status
       const representativeTask = taskGroup[0];
       const lastNotified = representativeTask.lastOverdueNotification || 0;
       const oneDayAgo = now - (24 * 60 * 60 * 1000);
       
       if (lastNotified < oneDayAgo) {
-        console.log(`📤 Sending overdue notification for "${title}" (last notified: ${lastNotified}, threshold: ${oneDayAgo})`);
+        console.log(`📤 Sending overdue notification for "${title}" (file: ${lastNotified}, global: ${lastGlobalNotification})`);
         await this.sendOverdueNotification(representativeTask);
         
-        // Update ALL tasks with this title
+        // Update BOTH file and global tracking
+        this.notificationCooldowns.set(title, now);
         tasks.forEach(t => {
           if (t.title === title) {
             t.lastOverdueNotification = now;
           }
         });
         
-        console.log(`📝 Updated lastOverdueNotification for all "${title}" tasks to prevent spam`);
+        console.log(`📝 Updated BOTH file and global tracking for "${title}"`);
       } else {
-        console.log(`⏳ Skipping "${title}" - already notified recently (last: ${lastNotified})`);
+        console.log(`⏳ File block: "${title}" - last file notification: ${lastNotified}`);
       }
     }
 
