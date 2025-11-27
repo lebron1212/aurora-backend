@@ -169,10 +169,8 @@ class TaskNotificationServer {
   async sendTaskNotification(task) {
     const notification = new apn.Notification();
     
-    notification.alert = {
-      title: `📋 ${task.title}`,
-      body: task.description || 'Task reminder'
-    };
+    const title = `📋 ${task.title}`;
+    let body = task.description || 'Task reminder';
     
     if (task.dueDate) {
       const dueDate = new Date(task.dueDate);
@@ -180,11 +178,13 @@ class TaskNotificationServer {
       const hoursUntilDue = Math.round((dueDate - now) / (1000 * 60 * 60));
       
       if (hoursUntilDue > 0) {
-        notification.alert.body = `${task.description || 'Task'} - Due in ${hoursUntilDue} hour${hoursUntilDue > 1 ? 's' : ''}`;
+        body = `${task.description || 'Task'} - Due in ${hoursUntilDue} hour${hoursUntilDue > 1 ? 's' : ''}`;
       } else {
-        notification.alert.body = `${task.description || 'Task'} - Due now!`;
+        body = `${task.description || 'Task'} - Due now!`;
       }
     }
+    
+    notification.alert = { title, body };
     
     notification.sound = 'default';
     notification.badge = 1;
