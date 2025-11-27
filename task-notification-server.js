@@ -42,11 +42,14 @@ const apnProvider = new apn.Provider(apnConfig);
 // Store device tokens (in production, use a database)
 const DEVICE_TOKENS_FILE = path.join(__dirname, 'device-tokens.json');
 const TASKS_FILE = path.join(__dirname, 'tasks.json'); // Store in backend dir for cloud
+const REMINDERS_FILE = path.join(__dirname, 'reminders.json'); // Store scheduled reminders
 
 class TaskNotificationServer {
   constructor() {
     this.deviceTokens = this.loadDeviceTokens();
+    this.reminders = this.loadReminders();
     this.checkInterval = null;
+    this.reminderInterval = null;
     this.POLL_INTERVAL = 60000; // Check every minute
   }
 
@@ -95,22 +98,84 @@ class TaskNotificationServer {
     fs.writeFileSync(TASKS_FILE, JSON.stringify(tasks, null, 2));
   }
 
+  loadReminders() {
+    try {
+      if (fs.existsSync(REMINDERS_FILE)) {
+        return JSON.parse(fs.readFileSync(REMINDERS_FILE, 'utf8'));
+      }
+    } catch (error) {
+      console.error('Error loading reminders:', error);
+    }
+    return [];
+  }
+
+  saveReminders(reminders) {
+    fs.writeFileSync(REMINDERS_FILE, JSON.stringify(reminders, null, 2));
+  }
+
   start() {
     console.log('🚀 Task Notification Server started');
+    console.log('⛔ TASK CHECKING PERMANENTLY DISABLED - NOTIFICATIONS ONLY');
+    console.log('⏰ REMINDER CHECKING ENABLED - Every minute');
     
-    // Initial check
-    this.checkAndSendReminders();
+    // DO NOT CHECK TASKS - ONLY PROVIDE API ENDPOINTS
+    // this.checkAndSendReminders();
+    // this.checkInterval = setInterval(() => {
+    //   this.checkAndSendReminders();
+    // }, this.POLL_INTERVAL);
     
-    // Set up recurring check
-    this.checkInterval = setInterval(() => {
-      this.checkAndSendReminders();
-    }, this.POLL_INTERVAL);
+    // Start checking for scheduled reminders
+    this.checkScheduledReminders();
+    this.reminderInterval = setInterval(() => {
+      this.checkScheduledReminders();
+    }, 60000); // Check every minute
   }
 
   stop() {
     if (this.checkInterval) {
       clearInterval(this.checkInterval);
-      console.log('🛑 Task Notification Server stopped');
+    }
+    if (this.reminderInterval) {
+      clearInterval(this.reminderInterval);
+    }
+    console.log('🛑 Task Notification Server stopped');
+  }
+
+  async checkScheduledReminders() {
+    const reminders = this.loadReminders();
+    const now = Date.now();
+    const pendingReminders = [];
+    
+    for (const reminder of reminders) {
+      if (reminder.scheduledFor <= now && !reminder.sent) {
+        console.log(`🔔 Sending scheduled reminder: "${reminder.title}"`);
+        
+        const notification = new apn.Notification();
+        notification.alert = { title: reminder.title, body: reminder.body };
+        notification.sound = reminder.sound || 'default';
+        notification.badge = 1;
+        notification.topic = 'com.aurora.es.app';
+        notification.payload = reminder.payload || {};
+        
+        try {
+          for (const device of this.deviceTokens) {
+            await apnProvider.send(notification, device.token);
+          }
+          reminder.sent = true;
+          reminder.sentAt = now;
+        } catch (error) {
+          console.error('Error sending reminder:', error);
+        }
+      }
+      
+      // Keep reminders that are still pending or were sent in the last 24 hours (for history)
+      if (!reminder.sent || (now - reminder.sentAt < 24 * 60 * 60 * 1000)) {
+        pendingReminders.push(reminder);
+      }
+    }
+    
+    if (pendingReminders.length !== reminders.length) {
+      this.saveReminders(pendingReminders);
     }
   }
 
@@ -441,6 +506,76 @@ app.post('/send-notification', async (req, res) => {
   }
 });
 
+// Schedule a reminder for a future time
+app.post('/schedule-reminder', (req, res) => {
+  const { title, body, scheduledFor, sound = 'default', payload = {} } = req.body;
+  
+  if (!title || !body || !scheduledFor) {
+    return res.status(400).json({ error: 'Title, body, and scheduledFor timestamp required' });
+  }
+  
+  const reminder = {
+    id: Date.now() + '-' + Math.random().toString(36).substr(2, 9),
+    title,
+    body,
+    scheduledFor: typeof scheduledFor === 'string' ? new Date(scheduledFor).getTime() : scheduledFor,
+    sound,
+    payload,
+    createdAt: Date.now(),
+    sent: false
+  };
+  
+  const reminders = server.loadReminders();
+  reminders.push(reminder);
+  server.saveReminders(reminders);
+  
+  const scheduledDate = new Date(reminder.scheduledFor);
+  console.log(`📅 Scheduled reminder "${title}" for ${scheduledDate.toISOString()}`);
+  
+  res.json({ 
+    success: true, 
+    message: `Reminder scheduled for ${scheduledDate.toLocaleString()}`,
+    reminder 
+  });
+});
+
+// Cancel a scheduled reminder
+app.post('/cancel-reminder', (req, res) => {
+  const { reminderId } = req.body;
+  
+  if (!reminderId) {
+    return res.status(400).json({ error: 'Reminder ID required' });
+  }
+  
+  const reminders = server.loadReminders();
+  const filteredReminders = reminders.filter(r => r.id !== reminderId);
+  
+  if (filteredReminders.length === reminders.length) {
+    return res.status(404).json({ error: 'Reminder not found' });
+  }
+  
+  server.saveReminders(filteredReminders);
+  console.log(`❌ Cancelled reminder ${reminderId}`);
+  
+  res.json({ success: true, message: 'Reminder cancelled' });
+});
+
+// Get all scheduled reminders
+app.get('/reminders', (req, res) => {
+  const reminders = server.loadReminders();
+  const now = Date.now();
+  
+  const active = reminders.filter(r => !r.sent && r.scheduledFor > now);
+  const pending = reminders.filter(r => !r.sent && r.scheduledFor <= now);
+  const sent = reminders.filter(r => r.sent);
+  
+  res.json({ 
+    active: active.sort((a, b) => a.scheduledFor - b.scheduledFor),
+    pending,
+    sent: sent.slice(-10) // Last 10 sent reminders
+  });
+});
+
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy', 
@@ -506,6 +641,9 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   POST /register-device - Register device token`);
   console.log(`   POST /send-test - Send test notification`);
   console.log(`   POST /send-notification - Send custom notification`);
+  console.log(`   POST /schedule-reminder - Schedule a future reminder`);
+  console.log(`   POST /cancel-reminder - Cancel a scheduled reminder`);
+  console.log(`   GET  /reminders - List all reminders`);
   console.log(`   POST /sync-tasks - Sync tasks/reminders for notifications`);
   console.log(`   GET  /health - Check server status`);
 });
