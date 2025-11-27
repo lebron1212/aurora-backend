@@ -436,6 +436,44 @@ app.post('/debug-register', (req, res) => {
   res.json({ success: true, message: 'Debug token registered', token: testToken });
 });
 
+// Cleanup endpoint to remove duplicate marriage tasks
+app.post('/cleanup-duplicates', (req, res) => {
+  const tasks = server.loadTasks();
+  const before = tasks.length;
+  
+  // Remove all marriage-related duplicates, keep only one
+  const marriageKeywords = ['marry', 'stella', 'donati', 'marriage', 'notification:', 'notify', 'reminder'];
+  const marriageTasks = tasks.filter(task => {
+    const title = task.title.toLowerCase();
+    return marriageKeywords.some(keyword => title.includes(keyword));
+  });
+  
+  const nonMarriageTasks = tasks.filter(task => {
+    const title = task.title.toLowerCase();
+    return !marriageKeywords.some(keyword => title.includes(keyword));
+  });
+  
+  // Keep only the first marriage task
+  const cleanMarriageTasks = marriageTasks.length > 0 ? [marriageTasks[0]] : [];
+  
+  const cleanedTasks = [...nonMarriageTasks, ...cleanMarriageTasks];
+  server.saveTasks(cleanedTasks);
+  
+  const after = cleanedTasks.length;
+  const removed = before - after;
+  
+  console.log(`🧹 Cleanup: Removed ${removed} duplicate tasks (${before} → ${after})`);
+  
+  res.json({ 
+    success: true, 
+    message: `Removed ${removed} duplicate tasks`,
+    before,
+    after,
+    marriageTasksFound: marriageTasks.length,
+    marriageTasksKept: cleanMarriageTasks.length
+  });
+});
+
 // Start HTTP server
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Notification API running on http://0.0.0.0:${PORT}`);
