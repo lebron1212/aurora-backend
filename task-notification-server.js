@@ -118,8 +118,20 @@ class TaskNotificationServer {
     const tasks = this.loadTasks();
     const now = Date.now();
     
+    // Deduplicate tasks by title to prevent spam
+    const seenTitles = new Set();
+    const uniqueTasks = tasks.filter(task => {
+      if (seenTitles.has(task.title)) {
+        return false; // Skip duplicate
+      }
+      seenTitles.add(task.title);
+      return true;
+    });
+    
+    console.log(`⏰ Checking ${uniqueTasks.length} unique tasks (filtered from ${tasks.length} total)...`);
+    
     // Find tasks that need reminders
-    const tasksToRemind = tasks.filter(task => {
+    const tasksToRemind = uniqueTasks.filter(task => {
       return (
         task.reminderEnabled &&
         task.reminderTime &&
@@ -129,7 +141,7 @@ class TaskNotificationServer {
       );
     });
 
-    console.log(`⏰ Checking tasks... Found ${tasksToRemind.length} tasks to remind`);
+    console.log(`⏰ Found ${tasksToRemind.length} tasks to remind`);
 
     for (const task of tasksToRemind) {
       await this.sendTaskNotification(task);
@@ -142,8 +154,8 @@ class TaskNotificationServer {
       }
     }
 
-    // Check for overdue tasks
-    const overdueTasks = tasks.filter(task => {
+    // Check for overdue tasks (also deduplicated)
+    const overdueTasks = uniqueTasks.filter(task => {
       return (
         task.dueDate &&
         task.dueDate < now &&
@@ -152,13 +164,20 @@ class TaskNotificationServer {
       );
     });
 
+    console.log(`⚠️ Found ${overdueTasks.length} overdue tasks`);
+
     for (const task of overdueTasks) {
       const lastNotified = task.lastOverdueNotification || 0;
       const oneDayAgo = now - (24 * 60 * 60 * 1000);
       
       if (lastNotified < oneDayAgo) {
         await this.sendOverdueNotification(task);
-        task.lastOverdueNotification = now;
+        
+        // Update the original task in the full list to track notification time
+        const originalTask = tasks.find(t => t.title === task.title);
+        if (originalTask) {
+          originalTask.lastOverdueNotification = now;
+        }
       }
     }
 
