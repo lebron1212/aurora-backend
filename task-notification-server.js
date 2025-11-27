@@ -173,11 +173,14 @@ class TaskNotificationServer {
       if (lastNotified < oneDayAgo) {
         await this.sendOverdueNotification(task);
         
-        // Update the original task in the full list to track notification time
-        const originalTask = tasks.find(t => t.title === task.title);
-        if (originalTask) {
-          originalTask.lastOverdueNotification = now;
-        }
+        // Update ALL matching tasks in the full list to track notification time
+        tasks.forEach(t => {
+          if (t.title === task.title) {
+            t.lastOverdueNotification = now;
+          }
+        });
+        
+        console.log(`📝 Updated lastOverdueNotification for "${task.title}" to prevent spam`);
       }
     }
 
