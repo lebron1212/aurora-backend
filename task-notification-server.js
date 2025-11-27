@@ -212,17 +212,17 @@ class TaskNotificationServer {
   async sendOverdueNotification(task) {
     const notification = new apn.Notification();
     
-    notification.alert = {
-      title: `⚠️ Overdue: ${task.title}`,
-      body: task.description || 'This task is overdue'
-    };
+    const title = `⚠️ Overdue: ${task.title}`;
+    let body = task.description || 'This task is overdue';
     
     if (task.dueDate) {
       const dueDate = new Date(task.dueDate);
       const now = new Date();
       const daysOverdue = Math.round((now - dueDate) / (1000 * 60 * 60 * 24));
-      notification.alert.body = `${task.description || 'Task'} - ${daysOverdue} day${daysOverdue > 1 ? 's' : ''} overdue`;
+      body = `${task.description || 'Task'} - ${daysOverdue} day${daysOverdue > 1 ? 's' : ''} overdue`;
     }
+    
+    notification.alert = { title, body };
     
     notification.sound = 'default';
     notification.badge = 1;
