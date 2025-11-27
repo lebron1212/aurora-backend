@@ -118,20 +118,10 @@ class TaskNotificationServer {
     const tasks = this.loadTasks();
     const now = Date.now();
     
-    // Deduplicate tasks by title to prevent spam
-    const seenTitles = new Set();
-    const uniqueTasks = tasks.filter(task => {
-      if (seenTitles.has(task.title)) {
-        return false; // Skip duplicate
-      }
-      seenTitles.add(task.title);
-      return true;
-    });
+    console.log(`⏰ Checking ${tasks.length} total tasks...`);
     
-    console.log(`⏰ Checking ${uniqueTasks.length} unique tasks (filtered from ${tasks.length} total)...`);
-    
-    // Find tasks that need reminders
-    const tasksToRemind = uniqueTasks.filter(task => {
+    // Find tasks that need reminders (check ALL tasks, not deduplicated)
+    const tasksToRemind = tasks.filter(task => {
       return (
         task.reminderEnabled &&
         task.reminderTime &&
@@ -141,21 +131,35 @@ class TaskNotificationServer {
       );
     });
 
-    console.log(`⏰ Found ${tasksToRemind.length} tasks to remind`);
+    // Deduplicate reminder tasks by title
+    const reminderTitles = new Set();
+    const uniqueReminders = tasksToRemind.filter(task => {
+      if (reminderTitles.has(task.title)) {
+        return false;
+      }
+      reminderTitles.add(task.title);
+      return true;
+    });
 
-    for (const task of tasksToRemind) {
+    console.log(`⏰ Found ${uniqueReminders.length} unique reminder tasks (from ${tasksToRemind.length} total)`);
+
+    for (const task of uniqueReminders) {
       await this.sendTaskNotification(task);
       
-      // Update task based on reminder type
-      if (task.reminderType === 'once') {
-        task.reminderEnabled = false;
-      } else {
-        task.reminderTime = this.calculateNextReminderTime(task);
-      }
+      // Update ALL matching tasks in the full list
+      tasks.forEach(t => {
+        if (t.title === task.title) {
+          if (task.reminderType === 'once') {
+            t.reminderEnabled = false;
+          } else {
+            t.reminderTime = this.calculateNextReminderTime(task);
+          }
+        }
+      });
     }
 
-    // Check for overdue tasks (also deduplicated)
-    const overdueTasks = uniqueTasks.filter(task => {
+    // Check for overdue tasks - but check lastOverdueNotification FIRST
+    const overdueTasks = tasks.filter(task => {
       return (
         task.dueDate &&
         task.dueDate < now &&
@@ -164,23 +168,39 @@ class TaskNotificationServer {
       );
     });
 
-    console.log(`⚠️ Found ${overdueTasks.length} overdue tasks`);
+    console.log(`⚠️ Found ${overdueTasks.length} total overdue tasks`);
 
-    for (const task of overdueTasks) {
-      const lastNotified = task.lastOverdueNotification || 0;
+    // Group by title and check notification status
+    const overdueGroups = new Map();
+    overdueTasks.forEach(task => {
+      if (!overdueGroups.has(task.title)) {
+        overdueGroups.set(task.title, []);
+      }
+      overdueGroups.get(task.title).push(task);
+    });
+
+    console.log(`⚠️ Found ${overdueGroups.size} unique overdue task groups`);
+
+    for (const [title, taskGroup] of overdueGroups) {
+      // Use the first task to check notification status
+      const representativeTask = taskGroup[0];
+      const lastNotified = representativeTask.lastOverdueNotification || 0;
       const oneDayAgo = now - (24 * 60 * 60 * 1000);
       
       if (lastNotified < oneDayAgo) {
-        await this.sendOverdueNotification(task);
+        console.log(`📤 Sending overdue notification for "${title}" (last notified: ${lastNotified}, threshold: ${oneDayAgo})`);
+        await this.sendOverdueNotification(representativeTask);
         
-        // Update ALL matching tasks in the full list to track notification time
+        // Update ALL tasks with this title
         tasks.forEach(t => {
-          if (t.title === task.title) {
+          if (t.title === title) {
             t.lastOverdueNotification = now;
           }
         });
         
-        console.log(`📝 Updated lastOverdueNotification for "${task.title}" to prevent spam`);
+        console.log(`📝 Updated lastOverdueNotification for all "${title}" tasks to prevent spam`);
+      } else {
+        console.log(`⏳ Skipping "${title}" - already notified recently (last: ${lastNotified})`);
       }
     }
 
