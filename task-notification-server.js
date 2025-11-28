@@ -576,6 +576,50 @@ app.get('/reminders', (req, res) => {
   });
 });
 
+// Send AI message as push notification
+app.post('/ai-notification', async (req, res) => {
+  const { title, message, type = 'ai_message', priority = 3 } = req.body;
+  
+  if (!title || !message) {
+    return res.status(400).json({ error: 'Title and message required' });
+  }
+  
+  // Determine notification properties based on type
+  let sound = 'default';
+  let badge = 1;
+  
+  // High priority messages get different sound
+  if (priority <= 2) {
+    sound = 'alert';
+  }
+  
+  const notification = new apn.Notification();
+  notification.alert = { title, body: message };
+  notification.sound = sound;
+  notification.badge = badge;
+  notification.topic = 'com.aurora.es.app';
+  notification.payload = { 
+    type,
+    priority,
+    timestamp: Date.now()
+  };
+  
+  try {
+    for (const device of server.deviceTokens) {
+      await apnProvider.send(notification, device.token);
+    }
+    console.log(`🤖 [AI] Sent ${type} notification: "${title}"`);
+    res.json({ 
+      success: true, 
+      message: 'AI notification sent',
+      deviceCount: server.deviceTokens.length 
+    });
+  } catch (error) {
+    console.error('Error sending AI notification:', error);
+    res.status(500).json({ error: 'Failed to send AI notification' });
+  }
+});
+
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'healthy', 
@@ -641,6 +685,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   POST /register-device - Register device token`);
   console.log(`   POST /send-test - Send test notification`);
   console.log(`   POST /send-notification - Send custom notification`);
+  console.log(`   POST /ai-notification - Send AI message as notification`);
   console.log(`   POST /schedule-reminder - Schedule a future reminder`);
   console.log(`   POST /cancel-reminder - Cancel a scheduled reminder`);
   console.log(`   GET  /reminders - List all reminders`);
