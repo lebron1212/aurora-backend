@@ -1636,6 +1636,30 @@ function generateInsights(extractions) {
   return insights;
 }
 
+// Create insightful notification for processing completion
+function createInsightfulNotification(extractions, insights, journalCount, date) {
+  // Create smart notification title and body
+  let title = "🧠 Journal Analysis Complete";
+  let body = `Processed ${journalCount} journal${journalCount > 1 ? 's' : ''} for ${date}`;
+  
+  // Add the most interesting insight
+  if (insights && insights.length > 0) {
+    const topInsight = insights[0];
+    body = `${topInsight} - ${body}`;
+  }
+  
+  // Make it more engaging based on extracted data
+  if (extractions.overallMood > 5) {
+    title = "😊 Positive Patterns Detected";
+  } else if (extractions.goals && extractions.goals.length > 2) {
+    title = "🎯 Goal-Rich Day Analyzed";
+  } else if (extractions.relationshipMentions && extractions.relationshipMentions.length > 3) {
+    title = "🤝 Social Connections Mapped";
+  }
+  
+  return { title, body };
+}
+
 // Automatic nightly processing scheduler (runs at 2 AM)
 function scheduleNightlyProcessing() {
   const now = new Date();
