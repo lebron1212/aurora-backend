@@ -1354,7 +1354,7 @@ async function performCrossDayAnalysis(currentExtractions, currentDate, apiKey) 
     console.log(`📊 [PATTERN ANALYSIS] Analyzing patterns across ${historicalData.length} days of data`);
 
     // Build comprehensive analysis prompt
-    const analysisPrompt = buildPatternAnalysisPrompt(currentExtractions, currentDate, historicalData);
+    const analysisPrompt = await buildPatternAnalysisPrompt(currentExtractions, currentDate, historicalData, apiKey);
     
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
@@ -1431,13 +1431,151 @@ function getHistoricalProcessingData(currentDate, daysBack) {
   }
 }
 
-// Build comprehensive pattern analysis prompt
-function buildPatternAnalysisPrompt(currentExtractions, currentDate, historicalData) {
-  const prompt = `CROSS-DAY BEHAVIORAL PATTERN ANALYSIS
+// Generate dynamic analysis prompt based on actual journal content
+async function generateDynamicAnalysisPrompt(historicalData, apiKey) {
+  if (!apiKey || historicalData.length < 3) {
+    return getDefaultAnalysisFramework();
+  }
 
-You are analyzing behavioral patterns across time. Today's data plus ${historicalData.length} days of historical data.
+  try {
+    // Extract actual themes from recent journal content
+    const recentContent = historicalData.slice(-7).map(day => ({
+      date: day.date,
+      content: day.fullExtractions?.keyEvents?.join(' ') || '',
+      goals: day.fullExtractions?.goals?.map(g => g.description).join(' ') || '',
+      relationships: day.fullExtractions?.relationshipMentions?.map(r => r.name + ': ' + r.context).join(' ') || ''
+    }));
 
-CURRENT DAY (${currentDate}):
+    const themeAnalysisPrompt = `Analyze these journal entries to identify the PRIMARY LIFE THEMES and STRATEGIC OPPORTUNITIES for pattern analysis:
+
+RECENT JOURNAL CONTENT:
+${recentContent.map(day => `
+Date: ${day.date}
+Content themes: ${day.content}
+Goals: ${day.goals}
+Relationships: ${day.relationships}
+`).join('\n')}
+
+Based on this actual content, identify:
+1. What are the 3-4 MOST IMPORTANT recurring themes in this person's life?
+2. What strategic decisions are they currently navigating?
+3. What patterns would be MOST VALUABLE for them to understand?
+4. What behavioral levers could create disproportionate impact?
+
+Return ONLY a JSON object with dynamic analysis categories:
+{
+  "primary_themes": ["theme1", "theme2", "theme3"],
+  "strategic_focus_areas": [
+    {
+      "category": "Strategic Category Name",
+      "questions": [
+        "Specific pattern to look for based on their content",
+        "Another strategic insight to discover"
+      ]
+    }
+  ],
+  "key_variables": ["variable1", "variable2"],
+  "success_metrics": ["what success looks like for this person"]
+}`;
+
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: 'gpt-4',
+        messages: [
+          {
+            role: 'system',
+            content: 'You are an expert at analyzing personal journal content to identify strategic life themes and optimization opportunities. Return only valid JSON.'
+          },
+          {
+            role: 'user',
+            content: themeAnalysisPrompt
+          }
+        ],
+        temperature: 0.3,
+        max_tokens: 1500
+      })
+    });
+
+    if (!response.ok) {
+      throw new Error(`Theme analysis failed: ${response.status}`);
+    }
+
+    const data = await response.json();
+    const themeResponse = data.choices[0].message.content;
+    
+    try {
+      const themes = JSON.parse(themeResponse.replace(/```json\n?/g, '').replace(/```\n?/g, ''));
+      return buildCustomAnalysisFramework(themes);
+    } catch (parseError) {
+      console.error('Failed to parse theme analysis:', parseError);
+      return getDefaultAnalysisFramework();
+    }
+
+  } catch (error) {
+    console.error('Dynamic prompt generation failed:', error);
+    return getDefaultAnalysisFramework();
+  }
+}
+
+// Build custom analysis framework from identified themes
+function buildCustomAnalysisFramework(themes) {
+  return `
+DYNAMIC LIFE OPTIMIZATION ANALYSIS
+Based on actual journal content, focus on these strategic areas:
+
+PRIMARY LIFE THEMES IDENTIFIED: ${themes.primary_themes?.join(', ') || 'Personal development, relationships, career'}
+
+STRATEGIC ANALYSIS FOCUS:
+${themes.strategic_focus_areas?.map(area => `
+${area.category.toUpperCase()}:
+${area.questions?.map(q => `- ${q}`).join('\n') || '- Analyze key patterns in this area'}
+`).join('\n') || 'CAREER: Analyze breakthrough patterns\nRELATIONSHIPS: Find attraction/connection levers\nCREATIVE: Identify flow state triggers'}
+
+KEY VARIABLES TO CORRELATE: ${themes.key_variables?.join(', ') || 'emotional states, social interactions, creative output, external responses'}
+
+SUCCESS METRICS: ${themes.success_metrics?.join(', ') || 'breakthrough moments, relationship progress, creative achievements'}
+
+FIND COUNTERINTUITIVE, ACTIONABLE PATTERNS that reveal hidden behavioral levers for optimization.`;
+}
+
+// Default framework fallback
+function getDefaultAnalysisFramework() {
+  return `
+STRATEGIC BEHAVIORAL ANALYSIS
+Focus on counterintuitive patterns that reveal hidden optimization levers:
+
+CAREER OPTIMIZATION:
+- When do breakthrough opportunities correlate with specific internal states?
+- What preparation methods predict success vs. self-sabotage?
+
+RELATIONSHIP DYNAMICS:
+- What behavioral patterns create attraction vs. repel (despite good intentions)?
+- How do internal processing cycles affect external relationship responses?
+
+CREATIVE FLOW:
+- When do breakthrough insights happen relative to other life cycles?
+- What combination of factors predict innovation vs. stagnation?
+
+MANIFESTATION MECHANICS:
+- When does "surrendering outcome" accelerate vs. signal avoidance?
+- What early indicators predict major external shifts?`;
+}
+
+// Build comprehensive pattern analysis prompt  
+async function buildPatternAnalysisPrompt(currentExtractions, currentDate, historicalData, apiKey) {
+  // First, dynamically analyze the journal content to understand current life themes
+  const dynamicFramework = await generateDynamicAnalysisPrompt(historicalData, apiKey);
+  
+  const prompt = `DYNAMIC BEHAVIORAL PATTERN ANALYSIS
+
+${dynamicFramework}
+
+CURRENT DAY ANALYSIS (${currentDate}):
 ${JSON.stringify(currentExtractions, null, 2)}
 
 HISTORICAL DATA (last ${historicalData.length} days):
@@ -1449,17 +1587,40 @@ Key themes: ${day.fullExtractions?.keyEvents?.slice(0, 2)?.join('; ') || 'none'}
 `).join('\n')}
 
 ANALYSIS OBJECTIVES:
-Find ACTIONABLE behavioral correlations that can optimize performance, mood, and decision-making.
+You are analyzing an actor's behavioral patterns to discover STRATEGIC LIFE INTELLIGENCE that can optimize career breakthroughs, relationship dynamics, creative flow, and personal manifestation. This person navigates:
 
-Look for these pattern types:
-1. TEMPORAL CORRELATIONS (what predicts what)
-2. LOCATION PATTERNS (where performance/mood peaks)
-3. SOCIAL AMPLIFIERS (people/interactions that boost outcomes)
-4. HABIT CASCADES (one behavior triggering others)
-5. EMOTIONAL CYCLES (mood patterns and triggers)
-6. PRODUCTIVITY OPTIMIZERS (conditions for peak performance)
-7. ENERGY MANAGEMENT (what drains vs. energizes)
-8. GOAL ACHIEVEMENT PATTERNS (what leads to progress)
+- Acting career (auditions, bookings, industry relationships, manager dynamics)
+- Deep romantic connection with "Stella" (complex spiritual/manifestation beliefs)
+- Creative tech projects (Aurora app development) 
+- Family dynamics and social circles
+- Internal spiritual/manifestation journey
+
+FIND REVOLUTIONARY INSIGHTS LIKE:
+
+CAREER WARFARE:
+- When do breakthrough auditions correlate with specific emotional states/life events?
+- What manager interaction patterns predict booking success vs. dead ends?
+- How does Stella-related processing affect audition performance (positively or negatively)?
+- What social dynamics with cast members create industry leverage vs. drain energy?
+
+MANIFESTATION MECHANICS:
+- When does "surrendering outcome" actually accelerate manifestation vs. when does it signal avoidance?
+- What combination of spiritual practices + tactical actions create breakthrough moments?
+- How do gratitude vs. desire-focused journal entries correlate with external shifts?
+- What early warning signs predict "spiritual bypassing" vs. authentic alignment?
+
+RELATIONSHIP STRATEGY:
+- What behavioral patterns actually create attraction vs. repel (despite good intentions)?
+- When does focus on Stella correlate with other life areas thriving vs. declining?
+- How do family stress periods affect romantic clarity and decision-making?
+- What social proof dynamics affect how Stella responds (Instagram interactions, mutual friends)?
+
+CREATIVE FLOW HACKING:
+- When do tech project breakthroughs happen relative to acting/relationship cycles?
+- What combination of locations, people, and internal states predict creative breakthroughs?
+- How does processing emotional complexity fuel vs. drain creative output?
+
+AVOID OBVIOUS PATTERNS. Find the counterintuitive, strategic insights that reveal hidden levers of influence.
 
 Return a JSON array of patterns found:
 [
@@ -1477,22 +1638,28 @@ Return a JSON array of patterns found:
 ]
 
 REQUIREMENTS:
-- Only include patterns with strong evidence (confidence > 0.6)
-- Focus on ACTIONABLE insights, not just observations
-- Look for causal relationships, not just coincidences
-- Consider multi-day lag effects (mood today affecting performance tomorrow)
-- Include quantitative evidence when possible
-- Maximum 10 patterns, prioritize by impact and actionability
+- Only include patterns with strong evidence AND strategic implications (confidence > 0.7)
+- Focus on COUNTERINTUITIVE insights that reveal hidden behavioral levers
+- Look for cascading effects: small actions → disproportionate outcomes
+- Find timing patterns: when specific actions have amplified effects
+- Identify warning signals: early indicators that predict major shifts
+- Maximum 8 patterns, prioritized by strategic impact and actionability
+- Each insight must suggest a specific behavioral intervention
 
-EXAMPLE GOOD PATTERNS:
-✅ "Gym sessions followed by 40% higher productivity scores the next day (correlation: 0.85, observed 8/10 times)"
-✅ "Coffee shop journaling correlates with 2x more breakthrough insights than home (correlation: 0.78)"
-✅ "Calls with Sarah precede mood improvements by 1-2 days (correlation: 0.71, observed 6/8 times)"
+EXAMPLE REVOLUTIONARY PATTERNS:
+✅ "Days spent processing Stella emotions correlate with 3x higher creative output on Aurora (observed 7/9 times) - emotional complexity fuels technical innovation"
+✅ "Instagram stories posted between 11pm-1am predict Stella viewing within 2 hours 85% of the time - late night posts bypass her conscious filters"  
+✅ "Manager meetings scheduled after family stress conversations result in 60% more opportunities offered (4/6 times) - vulnerability state enhances professional magnetism"
+✅ "Gratitude-heavy journal entries predict external manifestations within 5-10 days (correlation: 0.82) - but only when NOT written with Stella as primary focus"
+✅ "Friend cancellations (like Eddie) correlate with creative breakthroughs within 48 hours (5/7 times) - forced solitude activates innovation mode"
 
-BAD PATTERNS (too vague):
-❌ "Sometimes feels better after exercise"
-❌ "Likes coffee shops"
-❌ "Social interactions are good"`;
+REJECT SURFACE-LEVEL OBSERVATIONS:
+❌ "Positive emotions correlate with Stella mentions"
+❌ "Working on Aurora improves productivity"  
+❌ "Sleep affects energy levels"
+❌ "Family time creates gratitude"
+
+STRATEGIC INTELLIGENCE ONLY.`;
 
   return prompt;
 }
