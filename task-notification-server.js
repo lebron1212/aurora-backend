@@ -678,6 +678,239 @@ app.post('/cleanup-duplicates', (req, res) => {
   });
 });
 
+// Nightly processor endpoints
+const JOURNALS_FILE = path.join(__dirname, 'journals.json'); // Store journals for processing
+const PROCESSING_STATS_FILE = path.join(__dirname, 'processing-stats.json'); // Track processing history
+
+// Store journal data for nightly processing
+app.post('/sync-journals', (req, res) => {
+  const { journals, date, isInitialSync = false } = req.body;
+  
+  if (!journals || !date) {
+    return res.status(400).json({ error: 'Journals array and date required' });
+  }
+  
+  try {
+    // Load existing journal data
+    let storedJournals = {};
+    if (fs.existsSync(JOURNALS_FILE)) {
+      storedJournals = JSON.parse(fs.readFileSync(JOURNALS_FILE, 'utf8'));
+    }
+    
+    // Store journals by date
+    storedJournals[date] = journals;
+    
+    fs.writeFileSync(JOURNALS_FILE, JSON.stringify(storedJournals, null, 2));
+    
+    if (isInitialSync) {
+      console.log(`📚 [NIGHTLY] Initial sync: Stored ${journals.length} journals for ${date}`);
+    } else {
+      console.log(`📝 [NIGHTLY] Synced ${journals.length} journals for ${date}`);
+    }
+    
+    res.json({ 
+      success: true, 
+      message: `Stored ${journals.length} journals for ${date}`,
+      storedDates: Object.keys(storedJournals).length
+    });
+  } catch (error) {
+    console.error('Error syncing journals:', error);
+    res.status(500).json({ error: 'Failed to sync journals' });
+  }
+});
+
+// Initialize with a week's worth of journals (called manually)
+app.post('/initialize-week', async (req, res) => {
+  const { journalsByDate } = req.body;
+  
+  if (!journalsByDate || typeof journalsByDate !== 'object') {
+    return res.status(400).json({ error: 'journalsByDate object required with date keys and journal arrays as values' });
+  }
+  
+  try {
+    // Store all journals from the past week
+    fs.writeFileSync(JOURNALS_FILE, JSON.stringify(journalsByDate, null, 2));
+    
+    const dates = Object.keys(journalsByDate);
+    const totalJournals = Object.values(journalsByDate).reduce((sum, journals) => sum + (journals || []).length, 0);
+    
+    console.log(`📚 [NIGHTLY] Initialized with ${totalJournals} journals across ${dates.length} days`);
+    
+    // Optionally process the most recent days to bootstrap patterns
+    const recentDates = dates.sort().slice(-3); // Last 3 days
+    for (const date of recentDates) {
+      if (journalsByDate[date] && journalsByDate[date].length > 0) {
+        console.log(`🔄 [NIGHTLY] Bootstrap processing for ${date}`);
+        await processJournalsForDate(date, journalsByDate[date]);
+      }
+    }
+    
+    res.json({ 
+      success: true, 
+      message: `Initialized with ${totalJournals} journals across ${dates.length} days`,
+      processedDates: recentDates
+    });
+  } catch (error) {
+    console.error('Error initializing week:', error);
+    res.status(500).json({ error: 'Failed to initialize week' });
+  }
+});
+
+// Manual trigger for nightly processing
+app.post('/process-day', async (req, res) => {
+  const { date } = req.body;
+  
+  if (!date) {
+    return res.status(400).json({ error: 'Date required (YYYY-MM-DD format)' });
+  }
+  
+  try {
+    // Load journals for the specified date
+    let storedJournals = {};
+    if (fs.existsSync(JOURNALS_FILE)) {
+      storedJournals = JSON.parse(fs.readFileSync(JOURNALS_FILE, 'utf8'));
+    }
+    
+    const journalsForDate = storedJournals[date] || [];
+    
+    if (journalsForDate.length === 0) {
+      return res.json({ 
+        success: true, 
+        message: `No journals found for ${date}`,
+        processed: false
+      });
+    }
+    
+    console.log(`🌙 [NIGHTLY] Manual processing for ${date} - ${journalsForDate.length} journals`);
+    
+    const result = await processJournalsForDate(date, journalsForDate);
+    
+    res.json({ 
+      success: true, 
+      message: `Processed ${journalsForDate.length} journals for ${date}`,
+      result
+    });
+  } catch (error) {
+    console.error('Error processing day:', error);
+    res.status(500).json({ error: 'Failed to process day' });
+  }
+});
+
+// Get processing statistics
+app.get('/processing-stats', (req, res) => {
+  try {
+    let stats = { processedDays: 0, lastProcessed: null, totalJournalsProcessed: 0 };
+    
+    if (fs.existsSync(PROCESSING_STATS_FILE)) {
+      stats = JSON.parse(fs.readFileSync(PROCESSING_STATS_FILE, 'utf8'));
+    }
+    
+    // Also check how many journal dates we have stored
+    let storedDates = 0;
+    if (fs.existsSync(JOURNALS_FILE)) {
+      const journals = JSON.parse(fs.readFileSync(JOURNALS_FILE, 'utf8'));
+      storedDates = Object.keys(journals).length;
+    }
+    
+    res.json({ 
+      ...stats,
+      storedJournalDates: storedDates
+    });
+  } catch (error) {
+    console.error('Error getting stats:', error);
+    res.status(500).json({ error: 'Failed to get processing stats' });
+  }
+});
+
+// Simple journal processing function (placeholder)
+async function processJournalsForDate(date, journals) {
+  console.log(`📊 [NIGHTLY] Processing ${journals.length} journals for ${date}`);
+  
+  try {
+    // Update stats
+    let stats = { processedDays: 0, lastProcessed: null, totalJournalsProcessed: 0 };
+    if (fs.existsSync(PROCESSING_STATS_FILE)) {
+      stats = JSON.parse(fs.readFileSync(PROCESSING_STATS_FILE, 'utf8'));
+    }
+    
+    stats.processedDays++;
+    stats.lastProcessed = date;
+    stats.totalJournalsProcessed += journals.length;
+    
+    fs.writeFileSync(PROCESSING_STATS_FILE, JSON.stringify(stats, null, 2));
+    
+    // TODO: Add actual processing logic here
+    // For now, just simulate processing
+    const result = {
+      date,
+      journalCount: journals.length,
+      processedAt: new Date().toISOString(),
+      extractedGoals: Math.floor(Math.random() * 3), // Placeholder
+      extractedSituations: Math.floor(Math.random() * 2), // Placeholder
+      insights: journals.length > 0 ? ['Processing completed successfully'] : []
+    };
+    
+    // Send notification about processing completion
+    if (server.deviceTokens.length > 0) {
+      await server.sendImmediateNotification(
+        '🌙 Daily Processing Complete',
+        `Processed ${journals.length} journal entries from ${date}. New insights available.`
+      );
+    }
+    
+    return result;
+  } catch (error) {
+    console.error(`Error processing journals for ${date}:`, error);
+    throw error;
+  }
+}
+
+// Automatic nightly processing scheduler (runs at 2 AM)
+function scheduleNightlyProcessing() {
+  const now = new Date();
+  const target = new Date();
+  target.setHours(2, 0, 0, 0); // 2 AM
+  
+  // If it's already past 2 AM today, schedule for tomorrow
+  if (now.getTime() > target.getTime()) {
+    target.setDate(target.getDate() + 1);
+  }
+  
+  const msUntilTarget = target.getTime() - now.getTime();
+  
+  console.log(`⏰ [NIGHTLY] Scheduled next processing for ${target.toISOString()}`);
+  
+  setTimeout(async () => {
+    console.log('🌙 [NIGHTLY] Starting automatic nightly processing...');
+    
+    try {
+      // Get yesterday's date
+      const yesterday = new Date();
+      yesterday.setDate(yesterday.getDate() - 1);
+      const yesterdayStr = yesterday.toISOString().split('T')[0];
+      
+      // Load journals for yesterday
+      let storedJournals = {};
+      if (fs.existsSync(JOURNALS_FILE)) {
+        storedJournals = JSON.parse(fs.readFileSync(JOURNALS_FILE, 'utf8'));
+      }
+      
+      const journalsForYesterday = storedJournals[yesterdayStr] || [];
+      
+      if (journalsForYesterday.length > 0) {
+        await processJournalsForDate(yesterdayStr, journalsForYesterday);
+      } else {
+        console.log(`📝 [NIGHTLY] No journals found for ${yesterdayStr}`);
+      }
+    } catch (error) {
+      console.error('Error in automatic nightly processing:', error);
+    }
+    
+    // Schedule the next run (24 hours later)
+    scheduleNightlyProcessing();
+  }, msUntilTarget);
+}
+
 // Start HTTP server
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Notification API running on http://0.0.0.0:${PORT}`);
@@ -690,7 +923,14 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   POST /cancel-reminder - Cancel a scheduled reminder`);
   console.log(`   GET  /reminders - List all reminders`);
   console.log(`   POST /sync-tasks - Sync tasks/reminders for notifications`);
+  console.log(`   POST /sync-journals - Sync journal data for nightly processing`);
+  console.log(`   POST /initialize-week - Initialize with a week's worth of journals`);
+  console.log(`   POST /process-day - Manually trigger processing for a specific date`);
+  console.log(`   GET  /processing-stats - Get nightly processing statistics`);
   console.log(`   GET  /health - Check server status`);
+  
+  // Start nightly processing scheduler
+  scheduleNightlyProcessing();
 });
 
 // Start checking for task reminders
