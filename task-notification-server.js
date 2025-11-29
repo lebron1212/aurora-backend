@@ -43,6 +43,7 @@ const apnProvider = new apn.Provider(apnConfig);
 const DEVICE_TOKENS_FILE = path.join(__dirname, 'device-tokens.json');
 const TASKS_FILE = path.join(__dirname, 'tasks.json'); // Store in backend dir for cloud
 const REMINDERS_FILE = path.join(__dirname, 'reminders.json'); // Store scheduled reminders
+const CONVERSATIONS_FILE = path.join(__dirname, 'conversations.json'); // Store AI conversations
 
 class TaskNotificationServer {
   constructor() {
@@ -719,6 +720,49 @@ app.post('/sync-journals', (req, res) => {
   }
 });
 
+// Store AI conversation data for nightly processing
+app.post('/sync-conversations', (req, res) => {
+  const { date, conversations } = req.body;
+  
+  if (!conversations || !date) {
+    return res.status(400).json({ error: 'Conversations array and date required' });
+  }
+  
+  try {
+    let storedConversations = {};
+    if (fs.existsSync(CONVERSATIONS_FILE)) {
+      storedConversations = JSON.parse(fs.readFileSync(CONVERSATIONS_FILE, 'utf8'));
+    }
+    
+    // Store conversations by date (append to existing if same date)
+    if (!storedConversations[date]) {
+      storedConversations[date] = [];
+    }
+    
+    // Merge new conversations (dedupe by id)
+    const existingIds = new Set(storedConversations[date].map(c => c.id));
+    for (const conv of conversations) {
+      if (!existingIds.has(conv.id)) {
+        storedConversations[date].push(conv);
+        existingIds.add(conv.id);
+      }
+    }
+    
+    fs.writeFileSync(CONVERSATIONS_FILE, JSON.stringify(storedConversations, null, 2));
+    
+    console.log(`💬 [NIGHTLY] Synced ${conversations.length} conversations for ${date}`);
+    
+    res.json({ 
+      success: true, 
+      message: `Stored ${conversations.length} conversations for ${date}`,
+      storedDates: Object.keys(storedConversations).length
+    });
+  } catch (error) {
+    console.error('Error syncing conversations:', error);
+    res.status(500).json({ error: 'Failed to sync conversations' });
+  }
+});
+
 // Initialize with a week's worth of journals (called manually)
 app.post('/initialize-week', async (req, res) => {
   const { journalsByDate } = req.body;
@@ -819,6 +863,62 @@ app.get('/processing-stats', (req, res) => {
   } catch (error) {
     console.error('Error getting stats:', error);
     res.status(500).json({ error: 'Failed to get processing stats' });
+  }
+});
+
+// Get processing results for frontend integration
+app.get('/processing-results', (req, res) => {
+  try {
+    const { since, date, includePatterns = 'true' } = req.query;
+    
+    const resultsFile = path.join(__dirname, 'processing-results.json');
+    if (!fs.existsSync(resultsFile)) {
+      return res.json({ results: {}, dates: [] });
+    }
+    
+    const allResults = JSON.parse(fs.readFileSync(resultsFile, 'utf8'));
+    
+    let filteredResults = {};
+    
+    if (date) {
+      // Return specific date
+      if (allResults[date]) {
+        filteredResults[date] = allResults[date];
+      }
+    } else if (since) {
+      // Return all results since timestamp
+      const sinceTime = new Date(since).getTime();
+      for (const [dateKey, result] of Object.entries(allResults)) {
+        const processedTime = result.processedAt ? new Date(result.processedAt).getTime() : 0;
+        if (processedTime >= sinceTime) {
+          filteredResults[dateKey] = result;
+        }
+      }
+    } else {
+      // Return last 7 days by default
+      const dates = Object.keys(allResults).sort().slice(-7);
+      for (const d of dates) {
+        filteredResults[d] = allResults[d];
+      }
+    }
+    
+    // Optionally strip heavy pattern data
+    if (includePatterns === 'false') {
+      for (const dateKey of Object.keys(filteredResults)) {
+        delete filteredResults[dateKey].crossDayPatterns;
+        delete filteredResults[dateKey].fullExtractions;
+      }
+    }
+    
+    res.json({
+      results: filteredResults,
+      dates: Object.keys(filteredResults).sort(),
+      totalStoredDates: Object.keys(allResults).length
+    });
+    
+  } catch (error) {
+    console.error('Error getting processing results:', error);
+    res.status(500).json({ error: 'Failed to get processing results' });
   }
 });
 
@@ -960,119 +1060,191 @@ app.post('/patterns/contextual', (req, res) => {
   }
 });
 
-// Full journal processing function with AI analysis
+// Full processing function with AI analysis (enhanced with conversations + suggestions)
 async function processJournalsForDate(date, journals) {
-  console.log(`📊 [NIGHTLY] Processing ${journals.length} journals for ${date}`);
+  console.log(`📊 [NIGHTLY] Processing journals for ${date}`);
   
   try {
     const startTime = Date.now();
+    const openAIKey = process.env.OPENAI_API_KEY;
+    
+    // Load conversations for this date too
+    const conversations = loadConversationsForDate(date);
+    console.log(`💬 [NIGHTLY] Found ${conversations.length} conversations for ${date}`);
+    
+    // Combine content
+    const journalContent = journals.map(j => j.content).join('\n\n');
+    const conversationContent = conversations
+      .flatMap(conv => conv.turns || [])
+      .filter(turn => turn.role === 'user')
+      .map(turn => turn.content)
+      .join('\n\n');
+    
+    const combinedContent = [
+      journalContent ? `=== JOURNAL ENTRIES ===\n${journalContent}` : '',
+      conversationContent ? `=== AI CONVERSATIONS ===\n${conversationContent}` : ''
+    ].filter(Boolean).join('\n\n');
+    
+    if (!combinedContent.trim()) {
+      console.log(`📝 [NIGHTLY] Empty content for ${date}, skipping processing`);
+      return createEmptyProcessingResult(date, journals.length, startTime);
+    }
+
+    // Get historical data for context
+    const historicalData = getHistoricalProcessingData(date, 30);
     
     // Update stats
     let stats = { processedDays: 0, lastProcessed: null, totalJournalsProcessed: 0 };
     if (fs.existsSync(PROCESSING_STATS_FILE)) {
       stats = JSON.parse(fs.readFileSync(PROCESSING_STATS_FILE, 'utf8'));
     }
-    
     stats.processedDays++;
     stats.lastProcessed = date;
     stats.totalJournalsProcessed += journals.length;
-    
-    // Extract content for AI processing
-    const combinedContent = journals.map(j => j.content).join('\n\n');
-    
-    if (!combinedContent.trim()) {
-      console.log(`📝 [NIGHTLY] Empty content for ${date}, skipping processing`);
-      return {
-        date,
-        journalCount: journals.length,
-        processedAt: new Date().toISOString(),
-        extractedGoals: 0,
-        extractedSituations: 0,
-        extractedDesires: 0,
-        relationshipMentions: 0,
-        insights: ['No content to process'],
-        processingTime: Date.now() - startTime
-      };
-    }
 
-    // AI Analysis using GPT (if API key available)
+    // 1. AI Extraction
     let extractions = null;
-    const openAIKey = process.env.OPENAI_API_KEY;
-    
     if (openAIKey) {
       try {
-        console.log(`🧠 [NIGHTLY] Running AI analysis on ${journals.length} journal entries`);
-        extractions = await performAIAnalysis(combinedContent, date, openAIKey);
+        console.log(`🧠 [NIGHTLY] Running AI extraction on ${journals.length} journals + ${conversations.length} conversations`);
+        extractions = await performAIAnalysis(combinedContent, date, openAIKey, conversations.length > 0);
       } catch (error) {
-        console.error('❌ [NIGHTLY] AI analysis failed:', error);
+        console.error('❌ [NIGHTLY] AI extraction failed:', error);
       }
-    } else {
-      console.log('⚠️ [NIGHTLY] No OpenAI API key found, using basic analysis');
     }
-
-    // Fallback to basic analysis if AI fails
+    
     if (!extractions) {
       extractions = performBasicAnalysis(combinedContent, date);
     }
 
-    // Generate insights based on extractions
-    const insights = generateInsights(extractions);
-
-    // Perform multi-day pattern correlation analysis
+    // 2. Cross-day pattern analysis
     let crossDayPatterns = [];
-    try {
-      console.log(`🧠 [PATTERN ANALYSIS] Running cross-day correlation analysis...`);
-      crossDayPatterns = await performCrossDayAnalysis(extractions, date, openAIKey);
-    } catch (error) {
-      console.error('❌ [PATTERN ANALYSIS] Cross-day analysis failed:', error);
+    if (historicalData.length >= 3) {
+      try {
+        console.log(`🔄 [NIGHTLY] Running cross-day pattern analysis...`);
+        crossDayPatterns = await performCrossDayAnalysis(extractions, date, openAIKey);
+      } catch (error) {
+        console.error('❌ [NIGHTLY] Cross-day analysis failed:', error);
+      }
     }
 
+    // 3. Generate hypothesis suggestions
+    let hypothesisSuggestions = [];
+    if (openAIKey) {
+      hypothesisSuggestions = await generateHypothesisSuggestions(extractions, historicalData, openAIKey);
+    }
+
+    // 4. Generate narrative suggestions
+    let narrativeSuggestions = [];
+    if (openAIKey && historicalData.length >= 5) {
+      narrativeSuggestions = await generateNarrativeSuggestions(extractions, historicalData, openAIKey);
+    }
+
+    // 5. Generate smart questions
+    let smartQuestions = [];
+    if (openAIKey) {
+      smartQuestions = await generateSmartQuestions(extractions, historicalData, openAIKey);
+    }
+
+    // 6. Generate insights
+    const insights = generateInsights(extractions);
+
+    // Build result
     const result = {
       date,
       journalCount: journals.length,
+      conversationCount: conversations.length,
       processedAt: new Date().toISOString(),
-      extractedGoals: extractions.goals.length,
-      extractedSituations: extractions.situations.length,
-      extractedDesires: extractions.desires.length,
-      relationshipMentions: extractions.relationshipMentions.length,
+      
+      // Extractions for frontend to integrate
+      extractedGoals: extractions.goals?.length || 0,
+      extractedSituations: extractions.situations?.length || 0,
+      extractedDesires: extractions.desires?.length || 0,
+      relationshipMentions: extractions.relationshipMentions?.length || 0,
+      extractedMilestones: extractions.upcomingMilestones?.length || 0,
+      
+      // Scores
       overallMood: extractions.overallMood,
       energyLevel: extractions.energyLevel,
       productivityLevel: extractions.productivityLevel,
-      insights: insights,
-      crossDayPatterns: crossDayPatterns,
+      qualityScore: extractions.qualityScore,
+      
+      // Full data for frontend integration
+      fullExtractions: extractions,
+      
+      // Suggestions for frontend to act on
+      hypothesisSuggestions,
+      narrativeSuggestions,
+      smartQuestions,
+      
+      // Patterns
+      crossDayPatterns,
+      insights,
+      
+      // Meta
       processingTime: Date.now() - startTime
     };
 
-    // Save detailed results
+    // Save results
     const resultsFile = path.join(__dirname, 'processing-results.json');
     let allResults = {};
     if (fs.existsSync(resultsFile)) {
       allResults = JSON.parse(fs.readFileSync(resultsFile, 'utf8'));
     }
-    allResults[date] = { ...result, fullExtractions: extractions };
+    allResults[date] = result;
     fs.writeFileSync(resultsFile, JSON.stringify(allResults, null, 2));
 
-    // Update stats file
+    // Update stats
     fs.writeFileSync(PROCESSING_STATS_FILE, JSON.stringify(stats, null, 2));
     
-    // Send notification about processing completion
+    // Send notification
     if (server.deviceTokens.length > 0) {
       const { title, body } = createInsightfulNotification(extractions, insights, journals.length, date);
       await server.sendImmediateNotification(title, body);
     }
     
     console.log(`✅ [NIGHTLY] Completed processing for ${date} in ${result.processingTime}ms`);
+    console.log(`   📊 Extractions: ${result.extractedGoals} goals, ${result.extractedSituations} situations, ${result.extractedMilestones} milestones`);
+    console.log(`   💡 Suggestions: ${hypothesisSuggestions.length} hypotheses, ${narrativeSuggestions.length} narratives, ${smartQuestions.length} questions`);
+    console.log(`   🔄 Patterns: ${crossDayPatterns.length} cross-day patterns`);
+    
     return result;
     
   } catch (error) {
-    console.error(`❌ [NIGHTLY] Error processing journals for ${date}:`, error);
+    console.error(`❌ [NIGHTLY] Error processing for ${date}:`, error);
     throw error;
   }
 }
 
+// Helper for empty results
+function createEmptyProcessingResult(date, journalCount, startTime) {
+  return {
+    date,
+    journalCount,
+    conversationCount: 0,
+    processedAt: new Date().toISOString(),
+    extractedGoals: 0,
+    extractedSituations: 0,
+    extractedDesires: 0,
+    relationshipMentions: 0,
+    extractedMilestones: 0,
+    overallMood: 0,
+    energyLevel: 5,
+    productivityLevel: 5,
+    qualityScore: 0,
+    fullExtractions: null,
+    hypothesisSuggestions: [],
+    narrativeSuggestions: [],
+    smartQuestions: [],
+    crossDayPatterns: [],
+    insights: ['No content to process'],
+    processingTime: Date.now() - startTime
+  };
+}
+
 // AI Analysis using OpenAI
-async function performAIAnalysis(content, date, apiKey) {
-  const extractionPrompt = buildExtractionPrompt(content);
+async function performAIAnalysis(content, date, apiKey, includesConversations = false) {
+  const extractionPrompt = buildExtractionPrompt(content, includesConversations);
   
   const response = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
@@ -1085,7 +1257,7 @@ async function performAIAnalysis(content, date, apiKey) {
       messages: [
         {
           role: 'system',
-          content: 'You are an expert at analyzing personal journal entries and extracting meaningful patterns, goals, and insights.'
+          content: 'You are an expert at analyzing personal journal entries and AI conversations to extract meaningful patterns, goals, milestones, and insights. Return only valid JSON.'
         },
         {
           role: 'user',
@@ -1093,7 +1265,7 @@ async function performAIAnalysis(content, date, apiKey) {
         }
       ],
       temperature: 0.3,
-      max_tokens: 2000
+      max_tokens: 2500
     })
   });
 
@@ -1248,21 +1420,35 @@ function extractKeyEvents(content) {
   return sentences.slice(0, 3).map(s => s.trim());
 }
 
-// Build extraction prompt for AI
-function buildExtractionPrompt(content) {
-  return `Analyze this content from journal entries. Extract structured information about goals, situations, desires, relationships, and emotional patterns.
+// Build extraction prompt for AI (enhanced version with milestones + conversations)
+function buildExtractionPrompt(content, includesConversations = false) {
+  const sourceNote = includesConversations 
+    ? `The content includes:
+- Journal entries (personal reflections)
+- AI conversation snippets (things they told their AI assistant)
 
-Return a JSON object with this structure:
+Both sources reveal important patterns. Pay special attention to:
+- Patterns the user explicitly mentions ("I've noticed...", "Every time I...")
+- Things they tell their AI that they might not write in journals
+- Recurring themes across both sources`
+    : 'Analyze this journal content for patterns and insights.';
+
+  return `Analyze this content from the user's journal entries${includesConversations ? ' AND AI conversations' : ''}. Extract structured information about their goals, situations, desires, relationships, and emotional patterns.
+
+${sourceNote}
+
+Return a JSON object with the following structure:
+
 {
   "goals": [
     {
       "title": "Brief goal title",
-      "description": "What they want to achieve", 
+      "description": "What they want to achieve",
       "domain": "health|career|relationships|personal|financial|creative|learning|other",
       "priority": 1-10,
       "timeframe": "immediate|short|medium|long",
       "status": "new|progress|obstacle|completed|abandoned",
-      "evidence": "Exact quote from journal",
+      "evidence": "Exact quote from content",
       "confidence": 0.0-1.0
     }
   ],
@@ -1270,11 +1456,11 @@ Return a JSON object with this structure:
     {
       "title": "Situation name",
       "description": "Current situation they're dealing with",
-      "domain": "work|family|health|social|financial|living|other", 
+      "domain": "work|family|health|social|financial|living|other",
       "status": "ongoing|resolved|escalating|improving",
       "emotionalImpact": -1.0 to 1.0,
       "stressLevel": 0-10,
-      "evidence": "Exact quote from journal",
+      "evidence": "Exact quote from content",
       "confidence": 0.0-1.0
     }
   ],
@@ -1284,19 +1470,42 @@ Return a JSON object with this structure:
       "description": "Deeper description of the desire",
       "category": "experience|achievement|relationship|material|spiritual|knowledge|other",
       "intensity": 0-10,
-      "feasibility": 0-10, 
-      "evidence": "Exact quote from journal",
-      "confidence": 0.0-1.0
+      "feasibility": 0-10,
+      "evidence": "Exact quote from content",
+      "confidence": 0.0-1.0,
+      "linkedGoals": ["goal titles that might connect to this desire"]
     }
   ],
   "relationshipMentions": [
     {
-      "name": "Person's name or relationship",
+      "name": "Person's name (first name or relationship like 'mom')",
       "context": "Full sentence where they were mentioned",
       "emotionalTone": "very_positive|positive|neutral|negative|very_negative",
       "interactionType": "conflict|support|casual|intimate|professional|family",
       "significance": 0-10,
       "newInformation": true|false
+    }
+  ],
+  "emotionalStates": [
+    {
+      "primaryEmotion": "Main emotion (anxious, excited, frustrated, etc.)",
+      "intensity": 0-10,
+      "triggers": ["what caused this emotion"],
+      "duration": "momentary|hours|ongoing",
+      "context": "What was happening when they felt this"
+    }
+  ],
+  "keyEvents": ["Important things that happened today"],
+  "upcomingMilestones": [
+    {
+      "date": "YYYY-MM-DD (specific date if mentioned, or best estimate)",
+      "description": "What is happening (e.g., 'Meeting with Sarah', 'Job interview', 'Trip to NYC')",
+      "category": "milestone|challenge|turning_point",
+      "impact": "Why this matters to them",
+      "stakes": "What's at stake",
+      "backstory": "Any relevant history or context mentioned",
+      "thisTime": "What makes this particular occurrence significant (if mentioned)",
+      "confidence": 0.0-1.0
     }
   ],
   "overallMood": -10 to 10,
@@ -1305,7 +1514,17 @@ Return a JSON object with this structure:
   "qualityScore": 0-10
 }
 
-Journal Content:
+CRITICAL for milestones:
+- Look for specific future dates mentioned ("on December 8th", "next week", "in 9 days")
+- Identify events they're building up to or anxious about
+- Catch recurring events with specific timing ("we're talking again on...")
+- Note anything they're structuring their life around
+- Include both exciting milestones AND dreaded/anxious events
+- Calculate actual dates from relative references (e.g., "in 3 days" from today)
+
+Extract information that is explicitly mentioned or clearly implied. Be conservative with confidence scores.
+
+Content:
 ${content}`;
 }
 
@@ -1701,6 +1920,245 @@ function parsePatternAnalysisResponse(response) {
   }
 }
 
+// Generate hypothesis suggestions for frontend to create
+async function generateHypothesisSuggestions(extractions, historicalData, apiKey) {
+  if (!apiKey) return [];
+  
+  try {
+    const prompt = `Based on this daily extraction and historical patterns, suggest behavioral/emotional hypotheses about this person that could be tested over time.
+
+TODAY'S EXTRACTIONS:
+${JSON.stringify(extractions, null, 2)}
+
+HISTORICAL CONTEXT (last ${historicalData.length} days):
+${historicalData.slice(-7).map(day => `
+${day.date}: Mood ${day.overallMood}, Energy ${day.energyLevel}, Goals: ${day.extractedGoals}, Key: ${day.fullExtractions?.keyEvents?.slice(0, 2)?.join('; ') || 'none'}
+`).join('')}
+
+Generate 2-4 hypotheses. Each should be:
+- Testable through future journal entries
+- Specific enough to be proven/disproven
+- Actionable (suggests behavior change if true)
+
+Return JSON array:
+[
+  {
+    "claim": "Clear hypothesis statement (e.g., 'User performs better on auditions when they exercise the morning of')",
+    "summary": "Brief explanation of what this hypothesis means",
+    "domain": "emotional|behavioral|social|productivity|health|career|relationship",
+    "initialEvidence": "Quote or observation that sparked this hypothesis",
+    "testableBy": "How this can be tested (e.g., 'Track audition outcomes vs morning exercise')",
+    "confidence": 0.0-1.0
+  }
+]
+
+Focus on patterns like:
+- Triggers for emotions or productivity
+- Conditions that lead to success/failure
+- Relationship dynamics
+- Time-of-day or day-of-week effects
+- Cascading behaviors (A leads to B)`;
+
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: 'gpt-4',
+        messages: [
+          { role: 'system', content: 'You are a behavioral pattern analyst. Generate testable hypotheses about human behavior based on journal data. Return only valid JSON.' },
+          { role: 'user', content: prompt }
+        ],
+        temperature: 0.4,
+        max_tokens: 1500
+      })
+    });
+
+    if (!response.ok) throw new Error(`OpenAI API failed: ${response.status}`);
+
+    const data = await response.json();
+    const parsed = JSON.parse(data.choices[0].message.content.replace(/```json\n?/g, '').replace(/```\n?/g, ''));
+    
+    console.log(`💡 [NIGHTLY] Generated ${parsed.length} hypothesis suggestions`);
+    return Array.isArray(parsed) ? parsed : [];
+    
+  } catch (error) {
+    console.error('❌ [NIGHTLY] Hypothesis generation failed:', error);
+    return [];
+  }
+}
+
+// Generate narrative suggestions for important ongoing stories
+async function generateNarrativeSuggestions(extractions, historicalData, apiKey) {
+  if (!apiKey || historicalData.length < 3) return [];
+  
+  try {
+    // Find recurring themes across days
+    const allPeople = new Map();
+    const allSituations = new Map();
+    
+    for (const day of historicalData) {
+      const ext = day.fullExtractions;
+      if (!ext) continue;
+      
+      // Count people mentions
+      for (const rel of (ext.relationshipMentions || [])) {
+        const count = allPeople.get(rel.name) || 0;
+        allPeople.set(rel.name, count + 1);
+      }
+      
+      // Count situation themes
+      for (const sit of (ext.situations || [])) {
+        const key = sit.title.toLowerCase();
+        const count = allSituations.get(key) || 0;
+        allSituations.set(key, count + 1);
+      }
+    }
+    
+    // Find topics mentioned 3+ times
+    const recurringPeople = [...allPeople.entries()].filter(([_, count]) => count >= 3).map(([name]) => name);
+    const recurringSituations = [...allSituations.entries()].filter(([_, count]) => count >= 2).map(([title]) => title);
+    
+    if (recurringPeople.length === 0 && recurringSituations.length === 0) {
+      return [];
+    }
+
+    const prompt = `Based on journal analysis, these topics appear repeatedly and may warrant a "narrative" - a comprehensive story the AI should understand deeply:
+
+RECURRING PEOPLE: ${recurringPeople.join(', ') || 'none'}
+RECURRING SITUATIONS: ${recurringSituations.join(', ') || 'none'}
+
+RECENT CONTEXT:
+${historicalData.slice(-5).map(day => `
+${day.date}: ${day.fullExtractions?.keyEvents?.join('; ') || 'No events'}
+People: ${day.fullExtractions?.relationshipMentions?.map(r => r.name + ' (' + r.emotionalTone + ')').join(', ') || 'none'}
+`).join('')}
+
+For each recurring topic worth a narrative, suggest:
+[
+  {
+    "topic": "Name of person or situation",
+    "type": "person|situation|goal|theme",
+    "importance": 1-10,
+    "suggestedNarrativePrompt": "What the user should tell the AI to build a complete narrative (e.g., 'Tell me the full story of your relationship with X from the beginning')",
+    "knownContext": "What we already know from journals",
+    "gaps": ["What's missing that would help the AI understand better"]
+  }
+]
+
+Only suggest narratives for truly important, recurring themes. Max 3 suggestions.`;
+
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: 'gpt-4',
+        messages: [
+          { role: 'system', content: 'You identify important life narratives from journal patterns. Return only valid JSON.' },
+          { role: 'user', content: prompt }
+        ],
+        temperature: 0.3,
+        max_tokens: 1200
+      })
+    });
+
+    if (!response.ok) throw new Error(`OpenAI API failed: ${response.status}`);
+
+    const data = await response.json();
+    const parsed = JSON.parse(data.choices[0].message.content.replace(/```json\n?/g, '').replace(/```\n?/g, ''));
+    
+    console.log(`📖 [NIGHTLY] Generated ${parsed.length} narrative suggestions`);
+    return Array.isArray(parsed) ? parsed : [];
+    
+  } catch (error) {
+    console.error('❌ [NIGHTLY] Narrative suggestion failed:', error);
+    return [];
+  }
+}
+
+// Generate smart questions based on recent context
+async function generateSmartQuestions(extractions, historicalData, apiKey) {
+  if (!apiKey) return [];
+  
+  try {
+    const prompt = `Based on recent journal patterns, generate thoughtful questions the AI could ask to deepen understanding or prompt valuable reflection.
+
+TODAY'S EXTRACTIONS:
+- Goals: ${extractions.goals?.map(g => g.title).join(', ') || 'none'}
+- Situations: ${extractions.situations?.map(s => s.title).join(', ') || 'none'}
+- Mood: ${extractions.overallMood}/10
+- Key events: ${extractions.keyEvents?.join('; ') || 'none'}
+- Upcoming milestones: ${extractions.upcomingMilestones?.map(m => m.description + ' on ' + m.date).join(', ') || 'none'}
+
+RECENT PATTERNS:
+${historicalData.slice(-5).map(day => `${day.date}: Mood ${day.overallMood}, Energy ${day.energyLevel}`).join('\n')}
+
+Generate 5 questions. Each should be:
+- Open-ended (not yes/no)
+- Specific to their actual life (reference real goals/people/situations)
+- Designed to surface insights or prompt action
+- Varied in focus (don't all be about the same topic)
+
+Return JSON array:
+[
+  {
+    "text": "The question to ask",
+    "description": "Why this question matters / what insight it might surface",
+    "category": "reflection|planning|relationship|emotion|goal|pattern",
+    "relevanceScore": 0.0-1.0,
+    "basedOn": "What triggered this question (e.g., 'upcoming milestone: Dec 8 reunion')"
+  }
+]`;
+
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`
+      },
+      body: JSON.stringify({
+        model: 'gpt-4',
+        messages: [
+          { role: 'system', content: 'You generate insightful, personalized questions based on journal analysis. Return only valid JSON.' },
+          { role: 'user', content: prompt }
+        ],
+        temperature: 0.5,
+        max_tokens: 1200
+      })
+    });
+
+    if (!response.ok) throw new Error(`OpenAI API failed: ${response.status}`);
+
+    const data = await response.json();
+    const parsed = JSON.parse(data.choices[0].message.content.replace(/```json\n?/g, '').replace(/```\n?/g, ''));
+    
+    console.log(`❓ [NIGHTLY] Generated ${parsed.length} smart questions`);
+    return Array.isArray(parsed) ? parsed : [];
+    
+  } catch (error) {
+    console.error('❌ [NIGHTLY] Question generation failed:', error);
+    return [];
+  }
+}
+
+// Load conversations for a date
+function loadConversationsForDate(date) {
+  try {
+    if (!fs.existsSync(CONVERSATIONS_FILE)) return [];
+    
+    const allConversations = JSON.parse(fs.readFileSync(CONVERSATIONS_FILE, 'utf8'));
+    return allConversations[date] || [];
+  } catch (error) {
+    console.error('Error loading conversations:', error);
+    return [];
+  }
+}
+
 // Basic correlation analysis fallback
 function performBasicCorrelationAnalysis(currentExtractions, currentDate) {
   const patterns = [];
@@ -1886,9 +2344,11 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   GET  /reminders - List all reminders`);
   console.log(`   POST /sync-tasks - Sync tasks/reminders for notifications`);
   console.log(`   POST /sync-journals - Sync journal data for nightly processing`);
+  console.log(`   POST /sync-conversations - Sync AI conversation data`);
   console.log(`   POST /initialize-week - Initialize with a week's worth of journals`);
   console.log(`   POST /process-day - Manually trigger processing for a specific date`);
   console.log(`   GET  /processing-stats - Get nightly processing statistics`);
+  console.log(`   GET  /processing-results - Get processing results for frontend`);
   console.log(`   GET  /health - Check server status`);
   
   // Start nightly processing scheduler
