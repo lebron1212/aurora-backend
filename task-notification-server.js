@@ -2171,8 +2171,8 @@ JOURNALS:
 ${content}
 
 KNOWN CONTEXT:
-- Key People: ${existingContext.keyPeople?.map(p => p.name).join(', ') || 'None'}
-- Situations: ${existingContext.lifeState?.situations?.map(s => s.title).join(', ') || 'None'}
+- Key People: ${Array.isArray(existingContext.keyPeople) ? existingContext.keyPeople.map(p => p.name).join(', ') : 'None'}
+- Situations: ${Array.isArray(existingContext.lifeState?.situations) ? existingContext.lifeState.situations.map(s => s.title).join(', ') : 'None'}
 
 Find patterns that appear MULTIPLE TIMES (minimum 3 observations).
 
@@ -2285,12 +2285,11 @@ async function callGPTForModelBuild(prompt, apiKey) {
   }
 }
 
-// Automatic nightly processing scheduler (runs at 2 AM)
-// Automatic nightly processing scheduler (runs at 2 AM)
+// Automatic nightly processing scheduler (runs at 2 AM PST)
 function scheduleNightlyProcessing() {
   const now = new Date();
   const target = new Date();
-  target.setHours(2, 0, 0, 0); // 2 AM
+  target.setUTCHours(10, 0, 0, 0); // 2 AM PST = 10 AM UTC
   
   // If it's already past 2 AM today, schedule for tomorrow
   if (now.getTime() > target.getTime()) {
