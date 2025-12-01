@@ -2438,12 +2438,11 @@ async function callGPTForModelBuild(prompt, apiKey) {
   }
 }
 
-// Automatic nightly processing scheduler (runs at 2 AM)
-// Automatic nightly processing scheduler (runs at 2 AM)
+// Automatic nightly processing scheduler (runs at 2 AM PST)
 function scheduleNightlyProcessing() {
   const now = new Date();
   const target = new Date();
-  target.setHours(2, 0, 0, 0); // 2 AM
+  target.setUTCHours(10, 0, 0, 0); // 2 AM PST = 10 AM UTC
   
   // If it's already past 2 AM today, schedule for tomorrow
   if (now.getTime() > target.getTime()) {
