@@ -431,6 +431,8 @@ class TaskNotificationServer {
 // Create Express server for HTTP API
 import express from 'express';
 import cors from 'cors';
+import HorizonCRSService from './horizon-crs-service.js';
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 
@@ -442,6 +444,160 @@ app.use(express.json());
 
 // Create notification server instance
 const server = new TaskNotificationServer();
+
+// Create and initialize Horizon CRS service
+const horizonCRS = new HorizonCRSService();
+await horizonCRS.initialize();
+console.log('🧠 [HORIZON CRS] Service initialized');
+
+// Get manual trigger functions
+const { trigger: manualTrigger, status: crsStatus } = horizonCRS.setupManualTrigger();
+
+// ============================================================================
+// HORIZON V2 SYSTEM ENDPOINTS
+// ============================================================================
+
+// Full system export for client sync
+app.get('/system/export', async (req, res) => {
+  try {
+    console.log('📤 [SYSTEM] Exporting full system data...');
+    const systemExport = await horizonCRS.getSystemExport();
+    res.json(systemExport);
+  } catch (error) {
+    console.error('❌ [SYSTEM] Export failed:', error);
+    res.status(500).json({ error: 'Failed to export system data' });
+  }
+});
+
+// Single file from system
+app.get('/system/file/*', async (req, res) => {
+  try {
+    const filePath = req.params[0]; // Everything after /system/file/
+    console.log(`📁 [SYSTEM] Requesting file: ${filePath}`);
+    
+    const fileData = await horizonCRS.getSystemFile(filePath);
+    if (!fileData) {
+      return res.status(404).json({ error: 'File not found' });
+    }
+    
+    res.json(fileData);
+  } catch (error) {
+    console.error(`❌ [SYSTEM] Failed to get file ${req.params[0]}:`, error);
+    res.status(500).json({ error: 'Failed to read system file' });
+  }
+});
+
+// Current manifest only
+app.get('/system/manifest', async (req, res) => {
+  try {
+    console.log('📋 [SYSTEM] Requesting update manifest...');
+    const manifest = await horizonCRS.getSystemManifest();
+    if (!manifest) {
+      return res.status(404).json({ error: 'No manifest found' });
+    }
+    
+    res.json(manifest);
+  } catch (error) {
+    console.error('❌ [SYSTEM] Failed to get manifest:', error);
+    res.status(500).json({ error: 'Failed to read manifest' });
+  }
+});
+
+// Manual CRS processing trigger (for testing)
+app.post('/system/process', async (req, res) => {
+  try {
+    console.log('🔧 [SYSTEM] Manual CRS processing triggered...');
+    const status = crsStatus();
+    
+    if (status.isProcessing) {
+      return res.json({ 
+        success: false, 
+        message: 'CRS processing already in progress',
+        status 
+      });
+    }
+    
+    // Trigger processing in background
+    manualTrigger().catch(error => {
+      console.error('❌ [SYSTEM] Background processing failed:', error);
+    });
+    
+    res.json({ 
+      success: true, 
+      message: 'CRS processing started',
+      status 
+    });
+  } catch (error) {
+    console.error('❌ [SYSTEM] Failed to trigger processing:', error);
+    res.status(500).json({ error: 'Failed to trigger CRS processing' });
+  }
+});
+
+// CRS status check
+app.get('/system/status', (req, res) => {
+  try {
+    const status = crsStatus();
+    res.json(status);
+  } catch (error) {
+    console.error('❌ [SYSTEM] Failed to get status:', error);
+    res.status(500).json({ error: 'Failed to get CRS status' });
+  }
+});
+
+// Write file to system (for web client)
+app.post('/system/write', async (req, res) => {
+  try {
+    const { path, data } = req.body;
+    if (!path) {
+      return res.status(400).json({ error: 'Path is required' });
+    }
+    
+    console.log(`✏️ [SYSTEM] Writing file: ${path}`);
+    await horizonCRS.writeFile(path, data);
+    
+    res.json({ success: true, message: 'File written successfully' });
+  } catch (error) {
+    console.error(`❌ [SYSTEM] Failed to write file:`, error);
+    res.status(500).json({ error: 'Failed to write file' });
+  }
+});
+
+// Delete file from system (for web client)
+app.delete('/system/delete', async (req, res) => {
+  try {
+    const { path } = req.body;
+    if (!path) {
+      return res.status(400).json({ error: 'Path is required' });
+    }
+    
+    console.log(`🗑️ [SYSTEM] Deleting file: ${path}`);
+    await horizonCRS.deleteFile(path);
+    
+    res.json({ success: true, message: 'File deleted successfully' });
+  } catch (error) {
+    console.error(`❌ [SYSTEM] Failed to delete file:`, error);
+    res.status(500).json({ error: 'Failed to delete file' });
+  }
+});
+
+// List files in directory (for web client)
+app.post('/system/list', async (req, res) => {
+  try {
+    const { path } = req.body;
+    console.log(`📋 [SYSTEM] Listing files in: ${path || 'root'}`);
+    
+    const files = await horizonCRS.listFiles(path || '');
+    
+    res.json({ files: files.map(f => f.name).filter(Boolean) });
+  } catch (error) {
+    console.error(`❌ [SYSTEM] Failed to list files:`, error);
+    res.status(500).json({ error: 'Failed to list files' });
+  }
+});
+
+// ============================================================================
+// EXISTING NOTIFICATION ENDPOINTS
+// ============================================================================
 
 // HTTP Endpoints
 app.post('/register-device', (req, res) => {
@@ -685,7 +841,7 @@ const HORIZON_MODEL_FILE = path.join(__dirname, 'horizon-model.json');
 const CONVERSATIONS_FILE = path.join(__dirname, 'conversations.json');
 
 // Store journal data for nightly processing
-app.post('/sync-journals', (req, res) => {
+app.post('/sync-journals', async (req, res) => {
   const { journals, date, isInitialSync = false } = req.body;
   
   if (!journals || !date) {
@@ -693,21 +849,19 @@ app.post('/sync-journals', (req, res) => {
   }
   
   try {
-    // Load existing journal data
-    let storedJournals = {};
-    if (fs.existsSync(JOURNALS_FILE)) {
-      storedJournals = JSON.parse(fs.readFileSync(JOURNALS_FILE, 'utf8'));
-    }
+    // Load existing journal data from Supabase
+    let storedJournals = await horizonCRS.readFile('journals.json') || {};
     
     // Store journals by date
     storedJournals[date] = journals;
     
-    fs.writeFileSync(JOURNALS_FILE, JSON.stringify(storedJournals, null, 2));
+    // Write back to Supabase
+    await horizonCRS.writeFile('journals.json', storedJournals);
     
     if (isInitialSync) {
-      console.log(`📚 [NIGHTLY] Initial sync: Stored ${journals.length} journals for ${date}`);
+      console.log(`📚 [SYNC] Initial sync: Stored ${journals.length} journals for ${date}`);
     } else {
-      console.log(`📝 [NIGHTLY] Synced ${journals.length} journals for ${date}`);
+      console.log(`📝 [SYNC] Synced ${journals.length} journals for ${date}`);
     }
     
     res.json({ 
@@ -722,7 +876,7 @@ app.post('/sync-journals', (req, res) => {
 });
 
 // Store conversation data for nightly processing
-app.post('/sync-conversations', (req, res) => {
+app.post('/sync-conversations', async (req, res) => {
   const { date, conversations } = req.body;
   
   if (!date || !conversations) {
@@ -730,10 +884,8 @@ app.post('/sync-conversations', (req, res) => {
   }
   
   try {
-    let stored = {};
-    if (fs.existsSync(CONVERSATIONS_FILE)) {
-      stored = JSON.parse(fs.readFileSync(CONVERSATIONS_FILE, 'utf8'));
-    }
+    // Load existing conversation data from Supabase
+    let stored = await horizonCRS.readFile('conversations.json') || {};
     
     // Store by date, deduplicate by conversation ID
     if (!stored[date]) {
@@ -749,7 +901,8 @@ app.post('/sync-conversations', (req, res) => {
       }
     }
     
-    fs.writeFileSync(CONVERSATIONS_FILE, JSON.stringify(stored, null, 2));
+    // Write back to Supabase
+    await horizonCRS.writeFile('conversations.json', stored);
     
     console.log(`💬 [SYNC] Stored ${conversations.length} conversations for ${date}`);
     res.json({ 
@@ -772,8 +925,8 @@ app.post('/initialize-week', async (req, res) => {
   }
   
   try {
-    // Store all journals from the past week
-    fs.writeFileSync(JOURNALS_FILE, JSON.stringify(journalsByDate, null, 2));
+    // Store all journals from the past week in Supabase
+    await horizonCRS.writeFile('journals.json', journalsByDate);
     
     const dates = Object.keys(journalsByDate);
     const totalJournals = Object.values(journalsByDate).reduce((sum, journals) => sum + (journals || []).length, 0);
@@ -2171,8 +2324,8 @@ JOURNALS:
 ${content}
 
 KNOWN CONTEXT:
-- Key People: ${existingContext.keyPeople?.map(p => p.name).join(', ') || 'None'}
-- Situations: ${existingContext.lifeState?.situations?.map(s => s.title).join(', ') || 'None'}
+- Key People: ${Array.isArray(existingContext.keyPeople) ? existingContext.keyPeople.map(p => p.name).join(', ') : 'None'}
+- Situations: ${Array.isArray(existingContext.lifeState?.situations) ? existingContext.lifeState.situations.map(s => s.title).join(', ') : 'None'}
 
 Find patterns that appear MULTIPLE TIMES (minimum 3 observations).
 
@@ -2634,8 +2787,8 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   GET  /processing-results - Get processing results for frontend`);
   console.log(`   GET  /health - Check server status`);
   
-  // Start nightly processing scheduler
-  scheduleNightlyProcessing();
+  // Note: Old nightly processing disabled - CRS handles this now
+  // scheduleNightlyProcessing(); // DISABLED - using HorizonCRSService instead
 });
 
 // Start checking for task reminders
