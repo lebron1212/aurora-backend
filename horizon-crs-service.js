@@ -287,42 +287,49 @@ class HorizonCRSService {
 
     const existingNames = existingEntities.map(e => e.name.toLowerCase());
     
-    const systemPrompt = `You are a cognitive memory system extracting ENTITIES from personal journals.
+    const systemPrompt = `You are a cognitive memory system extracting DURABLE ENTITIES from personal journals.
 
-BE AGGRESSIVE - extract ANY named person, project, or place. When in doubt, CREATE the entity.
+BE SELECTIVE - only extract entities that will persist over time and be referenced again.
 
-ENTITY TYPES (in order of priority):
-1. people: ANY named person mentioned (Sarah, Dr. Smith, Mom, Mike, etc.) - ALWAYS extract these
-2. projects: Named projects, goals, initiatives ("the website redesign", "my fitness journey")
-3. places: Specific locations (cities, restaurants, offices, "the gym", "downtown office")
-4. concepts: Important recurring themes or values
+ENTITY TYPES (strict criteria):
+1. people: Named individuals ONLY (Sarah, Dr. Smith, Mom). Must be a proper name or clear identity.
+2. projects: Specific named projects or major goals ("Aurora app", "house renovation", "job search"). NOT generic activities.
+3. places: Specific named locations that recur ("the downtown office", "Blue Bottle Coffee", "Chicago")
 
-CRITICAL RULES:
-1. EVERY person name = new entity. No exceptions. Sarah mentioned once? Create Sarah entity.
-2. If someone is mentioned by name, they are important enough to be an entity
-3. Projects don't need formal names - "the project" or "work project" counts if discussed
-4. Err on the side of MORE entities, not fewer
-5. Salience: 0.9+ for people discussed in detail, 0.7+ for anyone mentioned by name
+DO NOT CREATE ENTITIES FOR:
+- Generic activities: "working out", "meditation", "programming"
+- Abstract concepts: "anxiety", "confidence", "creativity"  
+- Time references: "morning", "Tuesday", "next week"
+- Skills or traits: "programming skills", "AI features"
+- One-off events: "coffee meeting" (unless it's a recurring thing)
 
-Return JSON: { "entities": [...] }`;
+These belong in FACTS or PATTERNS, not entities.
 
-    const userPrompt = `Extract ALL entities from these journals. Be aggressive - any named person MUST become an entity.
+ENTITY TEST: Ask "Will I reference this specific thing by name in future conversations?"
+- "Sarah" → YES, she's a person I'll mention again
+- "The AI project" → YES, it's an ongoing named effort
+- "morning hours" → NO, that's just a time preference (→ goes in patterns)
+- "technical architecture" → NO, that's a topic (→ goes in facts)
 
-EXISTING ENTITIES (update these if mentioned again): ${existingNames.join(', ') || 'none yet'}
+Return JSON: { "entities": [...] } - aim for 1-4 entities max per processing run.`;
+
+    const userPrompt = `Extract ONLY durable, referenceable entities from these journals.
+
+EXISTING ENTITIES (do not duplicate): ${existingNames.join(', ') || 'none yet'}
 
 JOURNALS:
 ${journalText}
 
-IMPORTANT: If you see a name like "Sarah", "Mike", "Dr. Johnson" - that is a PERSON entity. Create it.
+Remember: People = YES. Named projects = YES. Generic concepts/activities = NO.
 
 For each entity return:
 {
-  "name": "Entity Name",
-  "category": "people|projects|places|concepts",
+  "name": "Entity Name (proper noun or specific name)",
+  "category": "people|projects|places",
   "aliases": ["nickname", "abbreviation"],
   "salience": 0.0-1.0,
-  "description": "Who/what this is based on journal context",
-  "relationshipToSelf": "friend|family|colleague|doctor|acquaintance|none (for non-people)"
+  "description": "Brief: who/what this is",
+  "relationshipToSelf": "friend|family|colleague|doctor|acquaintance|partner|mentor|other"
 }`;
 
     try {
@@ -417,58 +424,68 @@ For each entity return:
     console.log('📝 [CRS] Extracting facts...');
 
     const entityList = entities.map(e => `${e.name} (${e.category}, id: ${e.id})`).join('\n- ');
+    const existingFactContents = existingFacts.slice(-50).map(f => f.content).join('; ');
     
-    const systemPrompt = `You are a cognitive memory system extracting ATOMIC FACTS from personal journals.
+    const systemPrompt = `You are a cognitive memory system extracting SALIENT FACTS from personal journals.
 
-CRITICAL: Facts belong to the entity they are ABOUT, not the narrator.
-- "Sarah is excited about AI" → entityName: "Sarah" (it's about Sarah)
-- "I feel anxious" → entityName: "Self" (it's about the user)
-- "Sarah and I had coffee" → entityName: "Self" BUT relatedEntities: ["Sarah"] (user's action, Sarah involved)
-- "Sarah suggested meditation" → entityName: "Sarah" (Sarah's action/attribute)
+SELECTIVE EXTRACTION: Only extract facts that are:
+1. DURABLE - likely to remain true and be useful in future
+2. SPECIFIC - about a known entity (person, project, self)
+3. NON-OBVIOUS - provides real insight, not just restating events
 
 FACT CATEGORIES:
 - biographical: Who someone is, their role, background
-- preference: What someone likes/dislikes
-- belief: What someone believes or values  
-- relationship: How two entities relate to each other
-- habit: Behavioral patterns
-- health: Physical or mental health
-- emotional: Emotional states
-- progress: Progress on goals
-- insight: Realizations or learnings
+- preference: What someone likes/dislikes  
+- belief: What someone believes or values
+- relationship: How two entities relate
+- habit: Recurring behavioral patterns
+- health: Physical or mental health states
+- emotional: Significant emotional states
+- progress: Meaningful progress on goals
+- insight: Important realizations
 - skill: Abilities or expertise
 
-ATOMIC FACTS - break down into smallest truths:
-❌ BAD: "Had a great meeting with Sarah about the project"
-✅ GOOD: 
-  - "Sarah is involved in the project" (about Sarah)
-  - "User had a meeting with Sarah" (about Self, related: Sarah)
-  - "User feels positive about the project" (about Self)
+DO NOT EXTRACT:
+- Event summaries ("Had coffee with Sarah") → not durable
+- Temporary states ("Feeling tired today") → too transient
+- Generic observations → not insightful
+- Anything that just restates the journal text
+
+GOOD FACTS (durable, insightful):
+- "Sarah is excited about AI technology"
+- "User is more productive in morning hours"
+- "Sarah works on the same project as user"
+
+BAD FACTS (just restating events):
+- "User had a meeting with Sarah"
+- "User went to coffee shop"
+- "User discussed the project"
+
+TARGET: 3-6 high-quality facts total, not one per sentence.
 
 Return JSON: { "facts": [...] }`;
 
-    const userPrompt = `Extract ATOMIC facts from these journals.
+    const userPrompt = `Extract ONLY the most salient, durable facts from these journals.
 
 KNOWN ENTITIES:
 - ${entityList}
 
+EXISTING FACTS (don't duplicate similar ones):
+${existingFactContents || 'none yet'}
+
 JOURNALS:
 ${journalText}
 
-RULES:
-1. Each fact = ONE atomic truth
-2. entityName = who/what the fact is ABOUT (not who is narrating)
-3. Facts about other people go to THEIR entity, not Self
-4. Include Self in relatedEntities when the user is involved but fact is about someone else
+Extract 3-6 facts MAX that provide real insight. Skip event summaries.
 
 For each fact return:
 {
-  "content": "Single atomic fact (8-15 words ideal)",
-  "entityName": "The entity this fact is ABOUT",
+  "content": "Durable insight (8-15 words)",
+  "entityName": "Entity this fact is ABOUT",
   "category": "biographical|preference|belief|relationship|habit|health|emotional|progress|insight|skill",
   "confidence": 0.0-1.0,
   "temporality": "current|past|permanent",
-  "relatedEntities": ["other entities involved or mentioned"]
+  "relatedEntities": ["other entities involved"]
 }`;
 
     try {
@@ -524,45 +541,54 @@ For each fact return:
     console.log('🔄 [CRS] Extracting open loops...');
 
     const entityList = entities.map(e => e.name).join(', ');
+    const existingLoopTitles = existingLoops.filter(l => l.status === 'open').map(l => `- ${l.title}`).join('\n');
     
     const systemPrompt = `You are a cognitive memory system extracting OPEN LOOPS from personal journals.
 
-An OPEN LOOP is an unresolved item that needs attention:
-- Unanswered questions
-- Pending decisions
-- Unfinished tasks
-- Unresolved conflicts
-- Things to follow up on
-- Commitments made
+BE SELECTIVE - only extract CONCRETE action items or decisions, not vague concerns.
+
+OPEN LOOP = something specific that needs resolution:
+- Scheduled meeting/event coming up
+- Decision that must be made
+- Task with a deadline
+- Commitment to someone
+- Question awaiting answer
+
+DO NOT EXTRACT:
+- Vague feelings ("I should exercise more")
+- General concerns ("worried about work")
+- Ongoing situations without action item
+- Things already in existing loops
 
 LOOP TYPES:
-- question: Something the user is wondering about
-- decision: A choice that needs to be made
-- task: Something that needs to be done
-- followup: Something to check back on
-- conflict: An unresolved interpersonal issue
-- commitment: A promise or obligation
+- task: Something specific to do
+- decision: A choice to make
+- followup: Something to check on
+- commitment: A promise made
 
-PRIORITY:
-- 1: Urgent (needs attention soon)
-- 2: Important (should address this week)
-- 3: Normal (address when convenient)
+TARGET: 0-2 loops per processing run. If nothing concrete, return empty array.
 
 Return JSON: { "loops": [...] }`;
 
-    const userPrompt = `Extract open loops from these journals. Known entities: ${entityList}
+    const userPrompt = `Extract ONLY concrete open loops with clear next actions.
+
+EXISTING OPEN LOOPS (do not duplicate):
+${existingLoopTitles || 'none'}
+
+KNOWN ENTITIES: ${entityList || 'none'}
 
 JOURNALS:
 ${journalText}
 
+Return 0-2 loops MAX. Must be concrete with clear action.
+
 For each loop return:
 {
-  "title": "Brief title of the open loop",
-  "description": "What needs to be resolved",
-  "loopType": "question|decision|task|followup|conflict|commitment",
+  "title": "Specific action item (e.g., 'Coffee meeting with Sarah Tuesday')",
+  "loopType": "task|decision|followup|commitment",
   "priority": 1-3,
-  "relatedEntities": ["entity", "names"],
-  "nextStep": "Suggested next action (optional)"
+  "relatedEntities": ["entity names"],
+  "dueDate": "if mentioned (YYYY-MM-DD or 'this week' etc)"
 }`;
 
     try {
@@ -575,21 +601,29 @@ For each loop return:
         return {
           id: generateId('loop'),
           title: l.title,
-          description: l.description || '',
           loopType: l.loopType || 'task',
           priority: l.priority || 2,
           status: 'open',
           relatedEntityIds,
-          nextStep: l.nextStep || null,
+          dueDate: l.dueDate || null,
           createdAt: Date.now(),
           updatedAt: Date.now(),
           resolvedAt: null
         };
       });
 
-      // Check if existing loops should be marked resolved
-      const existingTitles = new Set(existingLoops.map(l => l.title.toLowerCase()));
-      const uniqueNewLoops = newLoops.filter(l => !existingTitles.has(l.title.toLowerCase()));
+      // Better deduplication - check for semantic overlap
+      const uniqueNewLoops = newLoops.filter(newLoop => {
+        const newWords = new Set(newLoop.title.toLowerCase().split(/\s+/).filter(w => w.length > 2));
+        
+        return !existingLoops.some(existing => {
+          if (existing.status === 'resolved') return false;
+          const existingWords = new Set(existing.title.toLowerCase().split(/\s+/).filter(w => w.length > 2));
+          const overlap = [...newWords].filter(w => existingWords.has(w)).length;
+          const similarity = overlap / Math.max(newWords.size, existingWords.size);
+          return similarity > 0.5; // 50% word overlap = duplicate
+        });
+      });
 
       const allLoops = [...existingLoops, ...uniqueNewLoops];
       
@@ -609,75 +643,86 @@ For each loop return:
   async processPatterns(journalText, facts, existingPatterns) {
     console.log('🔍 [CRS] Detecting patterns...');
 
-    const factSummary = facts.slice(-50).map(f => `[${f.category}] ${f.content}`).join('\n');
+    const factSummary = facts.slice(-30).map(f => `[${f.category}] ${f.content}`).join('\n');
+    const existingPatternClaims = existingPatterns.map(p => `- ${p.claim}`).join('\n');
     
-    const systemPrompt = `You are a cognitive memory system detecting PATTERNS in personal journals.
+    const systemPrompt = `You are a cognitive memory system detecting BEHAVIORAL PATTERNS from personal journals.
 
-A PATTERN is a recurring behavioral or emotional regularity:
-- Triggers that cause certain states
-- Time-based patterns (e.g., "stressed on Sunday nights")
-- Correlations between activities and outcomes
-- Repeated behaviors or reactions
-- Cause-and-effect relationships
+BE HIGHLY SELECTIVE - only identify patterns with clear evidence across MULTIPLE instances.
 
-PATTERN STATUS:
-- provisional: Hypothesis based on limited data
-- confirmed: Strong evidence across multiple instances
+A PATTERN must have:
+1. RECURRENCE - seen multiple times, not just once
+2. CAUSALITY - clear trigger → outcome relationship
+3. ACTIONABILITY - user could test or act on this insight
+
+GOOD PATTERNS:
+- "Morning hours are most productive for creative work" (testable, recurring)
+- "Exercise improves mood for several hours after" (causal, recurring)
+- "Meetings with Sarah boost confidence" (specific, observable)
+
+BAD PATTERNS (don't extract):
+- "User sometimes feels anxious" (too vague)
+- "User had a good meeting" (one-off event, not pattern)
+- "User likes coffee" (preference, not behavioral pattern)
 
 DOMAINS:
-- emotional: Patterns in emotional states
-- behavioral: Patterns in actions/behaviors
-- relational: Patterns in relationships
-- productivity: Patterns in work/output
-- health: Patterns in physical/mental health
-- creative: Patterns in creative work
+- productivity: Work output patterns
+- emotional: Mood/feeling patterns  
+- health: Physical/mental health patterns
+- relational: Relationship interaction patterns
+
+TARGET: 1-3 high-confidence patterns MAX. If no clear patterns, return empty array.
 
 Return JSON: { "patterns": [...] }`;
 
-    const userPrompt = `Detect behavioral patterns from these journals and facts:
+    const userPrompt = `Detect ONLY clear, recurring behavioral patterns.
 
-JOURNALS:
-${journalText}
+EXISTING PATTERNS (do not duplicate or rephrase):
+${existingPatternClaims || 'none yet'}
 
 RECENT FACTS:
 ${factSummary}
 
+JOURNALS:
+${journalText}
+
+Return 1-3 patterns MAX. Each must show clear recurrence. If nothing recurring, return empty array.
+
 For each pattern return:
 {
-  "claim": "Clear statement of the pattern (e.g., 'You tend to feel anxious before important meetings')",
-  "hypothesis": "Longer explanation of the pattern",
-  "domain": "emotional|behavioral|relational|productivity|health|creative",
-  "status": "provisional|confirmed",
+  "claim": "Concise pattern statement (10-15 words)",
+  "domain": "productivity|emotional|health|relational",
+  "status": "provisional",
   "strength": 0.0-1.0,
-  "evidence": ["Brief evidence point 1", "Brief evidence point 2"],
-  "testableBy": "How to test if this pattern is real"
+  "evidence": ["evidence 1", "evidence 2"]
 }`;
 
     try {
-      const result = await callOpenAI(systemPrompt, userPrompt, 0.4);
+      const result = await callOpenAI(systemPrompt, userPrompt, 0.3);
       const newPatterns = (result.patterns || []).map(p => ({
         id: generateId('pattern'),
         claim: p.claim,
-        hypothesis: p.hypothesis || p.claim,
         domain: p.domain || 'behavioral',
         status: p.status || 'provisional',
         strength: p.strength || 0.5,
         supportingFactIds: [],
         evidence: p.evidence || [],
-        testableBy: p.testableBy || '',
         createdAt: Date.now(),
-        updatedAt: Date.now(),
-        confirmedAt: p.status === 'confirmed' ? Date.now() : null
+        updatedAt: Date.now()
       }));
 
-      // Merge patterns (avoid duplicates by claim similarity)
-      const existingClaims = existingPatterns.map(p => p.claim.toLowerCase());
-      const uniqueNewPatterns = newPatterns.filter(p => 
-        !existingClaims.some(existing => 
-          existing.includes(p.claim.toLowerCase().substring(0, 30)) ||
-          p.claim.toLowerCase().includes(existing.substring(0, 30))
-        )
-      );
+      // Better deduplication - check for semantic overlap
+      const uniqueNewPatterns = newPatterns.filter(newP => {
+        const newWords = new Set(newP.claim.toLowerCase().split(/\s+/).filter(w => w.length > 3));
+        
+        return !existingPatterns.some(existingP => {
+          const existingWords = new Set(existingP.claim.toLowerCase().split(/\s+/).filter(w => w.length > 3));
+          // Calculate word overlap
+          const overlap = [...newWords].filter(w => existingWords.has(w)).length;
+          const similarity = overlap / Math.max(newWords.size, existingWords.size);
+          return similarity > 0.5; // 50% word overlap = duplicate
+        });
+      });
 
       const allPatterns = [...existingPatterns, ...uniqueNewPatterns];
       
@@ -700,43 +745,59 @@ For each pattern return:
     const peopleEntities = entities.filter(e => e.category === 'people' && e.id !== 'self');
     const projectEntities = entities.filter(e => e.category === 'projects');
     const entityNames = [...peopleEntities, ...projectEntities].map(e => e.name).join(', ');
+    const existingNarrativeTopics = existingNarratives.map(n => `- ${n.topic} (${n.type})`).join('\n');
     
-    const systemPrompt = `You are a cognitive memory system generating NARRATIVES from personal journals.
+    const systemPrompt = `You are a cognitive memory system generating NARRATIVE ARCS from personal journals.
 
-A NARRATIVE is a story arc that tracks development over time:
-- Relationship arcs (how a relationship is evolving)
-- Project/goal arcs (progress toward something)
-- Personal growth arcs (self-development journeys)
-- Challenge arcs (dealing with difficulties)
+BE HIGHLY SELECTIVE - only create narratives for major ongoing storylines.
 
-TRAJECTORY:
-- improving: Things are getting better
-- declining: Things are getting worse
-- stable: Steady state
-- chaotic: Unpredictable changes
-- transforming: Major shift happening
+NARRATIVE TYPES:
+- relationship: A significant relationship with a specific person (combine all interactions with same person)
+- project: A named project or major goal  
+- growth: Personal development theme (combine related growth areas)
+
+RULES:
+1. ONE narrative per person (not separate for "relationship" and "project" with same person)
+2. ONE narrative per project (not duplicates with slightly different names)
+3. Combine related themes into single narratives
+4. Max 2-3 narratives total per processing run
+
+GOOD NARRATIVES:
+- "Collaboration with Sarah" (combines all Sarah interactions)
+- "Career transition" (combines job search, skills, confidence)
+- "Health & fitness journey" (combines exercise, diet, energy)
+
+BAD NARRATIVES (too fragmented):
+- "Relationship with Sarah" AND "Project with Sarah" (should be one)
+- "The project" AND "The new project" AND "Work project" (should be one)
+- "Confidence" AND "Programming skills" AND "Personal growth" (should be one)
+
+TRAJECTORY: improving | declining | stable | uncertain
 
 Return JSON: { "narratives": [...] }`;
 
-    const userPrompt = `Generate narrative arcs from these journals. Key entities: ${entityNames}
+    const userPrompt = `Generate 1-3 HIGH-LEVEL narrative arcs. Combine related themes.
+
+KEY ENTITIES: ${entityNames || 'none yet'}
+
+EXISTING NARRATIVES (update these, don't create duplicates):
+${existingNarrativeTopics || 'none yet'}
 
 JOURNALS:
 ${journalText}
 
 For each narrative return:
 {
-  "topic": "What/who this narrative is about",
-  "type": "relationship|project|growth|challenge",
-  "summary": "2-3 sentence summary of the current arc",
-  "trajectory": "improving|declining|stable|chaotic|transforming",
-  "characters": ["entity", "names", "involved"],
-  "keyMoments": ["Important moment 1", "Important moment 2"],
-  "currentChallenge": "What's the main challenge right now (if any)",
-  "contextPacket": "A paragraph the AI can use to understand this narrative when talking to the user"
+  "topic": "Clear topic name (e.g., 'Collaboration with Sarah')",
+  "type": "relationship|project|growth",
+  "summary": "1-2 sentences on current state",
+  "trajectory": "improving|declining|stable|uncertain",
+  "characters": ["entity names involved"],
+  "currentChallenge": "Main challenge (if any)"
 }`;
 
     try {
-      const result = await callOpenAI(systemPrompt, userPrompt, 0.5);
+      const result = await callOpenAI(systemPrompt, userPrompt, 0.4);
       const newNarratives = (result.narratives || []).map(n => {
         const characterIds = (n.characters || [])
           .map(name => entities.find(e => e.name.toLowerCase() === name.toLowerCase())?.id)
@@ -749,30 +810,34 @@ For each narrative return:
           summary: n.summary,
           trajectory: n.trajectory || 'stable',
           characterIds,
-          keyMoments: n.keyMoments || [],
           currentChallenge: n.currentChallenge || null,
-          contextPacket: n.contextPacket || n.summary,
-          lastReferencedAt: Date.now(),
           createdAt: Date.now(),
           updatedAt: Date.now()
         };
       });
 
-      // Merge narratives (update existing by topic)
+      // Better deduplication - check for semantic overlap on topic
       const allNarratives = [...existingNarratives];
       for (const newNarrative of newNarratives) {
-        const existingIndex = allNarratives.findIndex(n => 
-          n.topic.toLowerCase() === newNarrative.topic.toLowerCase()
-        );
+        // Find existing narrative with similar topic (word overlap)
+        const newWords = new Set(newNarrative.topic.toLowerCase().split(/\s+/).filter(w => w.length > 2));
+        
+        const existingIndex = allNarratives.findIndex(existing => {
+          const existingWords = new Set(existing.topic.toLowerCase().split(/\s+/).filter(w => w.length > 2));
+          const overlap = [...newWords].filter(w => existingWords.has(w)).length;
+          const similarity = overlap / Math.max(newWords.size, existingWords.size);
+          return similarity > 0.4 || // 40% word overlap
+                 existing.topic.toLowerCase().includes(newNarrative.topic.toLowerCase()) ||
+                 newNarrative.topic.toLowerCase().includes(existing.topic.toLowerCase());
+        });
+
         if (existingIndex >= 0) {
           // Update existing narrative
           allNarratives[existingIndex] = {
             ...allNarratives[existingIndex],
             summary: newNarrative.summary,
             trajectory: newNarrative.trajectory,
-            keyMoments: [...new Set([...allNarratives[existingIndex].keyMoments, ...newNarrative.keyMoments])],
             currentChallenge: newNarrative.currentChallenge,
-            contextPacket: newNarrative.contextPacket,
             updatedAt: Date.now()
           };
         } else {
@@ -873,25 +938,49 @@ For each narrative return:
 
   async loadExistingSystemFiles(type) {
     try {
-      const { data: files } = await supabase.storage
+      const basePath = `system/${type}`;
+      const allFiles = [];
+      
+      // First list the base directory
+      const { data: items } = await supabase.storage
         .from('horizon-files')
-        .list(`system/${type}`, { recursive: true });
+        .list(basePath);
 
-      if (!files) return [];
+      if (!items) return [];
 
-      const systemFiles = [];
-      for (const file of files) {
-        if (file.name.endsWith('.json') && file.name !== '.keep') {
-          // Handle nested directories (like entities/people/)
-          const path = file.id ? `system/${type}/${file.name}` : `system/${type}/${file.name}`;
-          const content = await this.readFile(path);
+      for (const item of items) {
+        if (item.name === '.keep') continue;
+        
+        // Check if it's a directory (no metadata means directory in Supabase)
+        if (!item.metadata || item.id === null) {
+          // It's a subdirectory, list its contents
+          const subPath = `${basePath}/${item.name}`;
+          const { data: subItems } = await supabase.storage
+            .from('horizon-files')
+            .list(subPath);
+          
+          if (subItems) {
+            for (const subItem of subItems) {
+              if (subItem.name.endsWith('.json') && subItem.name !== '.keep') {
+                const filePath = `${subPath}/${subItem.name}`;
+                const content = await this.readFile(filePath);
+                if (content && typeof content === 'object') {
+                  allFiles.push(content);
+                }
+              }
+            }
+          }
+        } else if (item.name.endsWith('.json')) {
+          // It's a file at the base level
+          const filePath = `${basePath}/${item.name}`;
+          const content = await this.readFile(filePath);
           if (content && typeof content === 'object') {
-            systemFiles.push(content);
+            allFiles.push(content);
           }
         }
       }
 
-      return systemFiles;
+      return allFiles;
     } catch (error) {
       console.error(`❌ [CRS] Failed to load existing ${type}:`, error.message);
       return [];
