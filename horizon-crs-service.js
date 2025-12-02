@@ -283,52 +283,53 @@ class HorizonCRSService {
   // ============================================================================
 
   async processEntities(journalText, existingEntities) {
-    console.log('👥 [CRS] Extracting entities...');
+    console.log('👥 [CRS] Extracting entities (v3 balanced)...');
 
     const existingNames = existingEntities.map(e => e.name.toLowerCase());
     
-    const systemPrompt = `You are a cognitive memory system extracting DURABLE ENTITIES from personal journals.
+    const systemPrompt = `You are a cognitive memory system extracting ENTITIES from personal journals.
 
-BE SELECTIVE - only extract entities that will persist over time and be referenced again.
+ENTITY RULES (v3 Balanced):
 
-ENTITY TYPES (strict criteria):
-1. people: Named individuals ONLY (Sarah, Dr. Smith, Mom). Must be a proper name or clear identity.
-2. projects: Specific named projects or major goals ("Aurora app", "house renovation", "job search"). NOT generic activities.
-3. places: Specific named locations that recur ("the downtown office", "Blue Bottle Coffee", "Chicago")
+✅ ALWAYS create an entity for:
+- Proper nouns referring to people (Sarah, Mom, Dr. Lee, Mike)
+- Recurring project/work items (AI Project, Marketing Plan, "the project")
+- Organizations or teams (Our team, OpenAI, Department)
+- Named events that will happen (Architecture Meeting, Tuesday Coffee)
 
-DO NOT CREATE ENTITIES FOR:
-- Generic activities: "working out", "meditation", "programming"
-- Abstract concepts: "anxiety", "confidence", "creativity"  
-- Time references: "morning", "Tuesday", "next week"
-- Skills or traits: "programming skills", "AI features"
-- One-off events: "coffee meeting" (unless it's a recurring thing)
+✅ CREATE if it appears 2+ times:
+- A specific place (downtown coffee shop, the gym, the office)
+- A long-term concept (anxiety, confidence, morning creativity)
 
-These belong in FACTS or PATTERNS, not entities.
+🚫 DO NOT create entities for:
+- Activities (working out, coding, sleeping)
+- Adjectives or states (excited, stressed, confident)
+- Generic concepts (programming skills, AI features, technical architecture)
+- Time phrases (morning hours, next week)
 
-ENTITY TEST: Ask "Will I reference this specific thing by name in future conversations?"
-- "Sarah" → YES, she's a person I'll mention again
-- "The AI project" → YES, it's an ongoing named effort
-- "morning hours" → NO, that's just a time preference (→ goes in patterns)
-- "technical architecture" → NO, that's a topic (→ goes in facts)
+QUANTITY RULES:
+- MINIMUM: 1 entity if any person is mentioned by name
+- MAXIMUM: 4 entities per processing run
+- If a person is named (Sarah, Mike, etc.) → MUST create entity
 
-Return JSON: { "entities": [...] } - aim for 1-4 entities max per processing run.`;
+Return JSON: { "entities": [...] }`;
 
-    const userPrompt = `Extract ONLY durable, referenceable entities from these journals.
+    const userPrompt = `Extract entities from these journals.
 
-EXISTING ENTITIES (do not duplicate): ${existingNames.join(', ') || 'none yet'}
+EXISTING ENTITIES (don't duplicate): ${existingNames.join(', ') || 'none yet'}
 
 JOURNALS:
 ${journalText}
 
-Remember: People = YES. Named projects = YES. Generic concepts/activities = NO.
+CRITICAL: If you see ANY person's name (Sarah, Mom, Dr. Smith, etc.), you MUST create an entity for them.
 
-For each entity return:
+Return 1-4 entities. For each:
 {
-  "name": "Entity Name (proper noun or specific name)",
+  "name": "Entity Name",
   "category": "people|projects|places",
-  "aliases": ["nickname", "abbreviation"],
-  "salience": 0.0-1.0,
-  "description": "Brief: who/what this is",
+  "aliases": [],
+  "salience": 0.5-1.0,
+  "description": "Brief description",
   "relationshipToSelf": "friend|family|colleague|doctor|acquaintance|partner|mentor|other"
 }`;
 
@@ -421,71 +422,66 @@ For each entity return:
   // ============================================================================
 
   async processFacts(journalText, entities, existingFacts) {
-    console.log('📝 [CRS] Extracting facts...');
+    console.log('📝 [CRS] Extracting facts (v3 balanced)...');
 
-    const entityList = entities.map(e => `${e.name} (${e.category}, id: ${e.id})`).join('\n- ');
-    const existingFactContents = existingFacts.slice(-50).map(f => f.content).join('; ');
+    const entityList = entities.map(e => `${e.name} (${e.category})`).join(', ');
+    const existingFactContents = existingFacts.slice(-20).map(f => f.content).join('; ');
     
-    const systemPrompt = `You are a cognitive memory system extracting SALIENT FACTS from personal journals.
+    const systemPrompt = `You are a cognitive memory system extracting FACTS from personal journals.
 
-SELECTIVE EXTRACTION: Only extract facts that are:
-1. DURABLE - likely to remain true and be useful in future
-2. SPECIFIC - about a known entity (person, project, self)
-3. NON-OBVIOUS - provides real insight, not just restating events
+FACT RULES (v3 Balanced):
 
-FACT CATEGORIES:
-- biographical: Who someone is, their role, background
-- preference: What someone likes/dislikes  
-- belief: What someone believes or values
-- relationship: How two entities relate
-- habit: Recurring behavioral patterns
-- health: Physical or mental health states
-- emotional: Significant emotional states
-- progress: Meaningful progress on goals
-- insight: Important realizations
-- skill: Abilities or expertise
+✅ ALWAYS extract facts for:
+- How the user FEELS (emotions, mood states)
+- How the user THINKS about someone
+- Progress or changes in a project
+- Plans, decisions, or observations involving entities
+- Self-insights and realizations
 
-DO NOT EXTRACT:
-- Event summaries ("Had coffee with Sarah") → not durable
-- Temporary states ("Feeling tired today") → too transient
-- Generic observations → not insightful
-- Anything that just restates the journal text
+✅ GOOD FACTS (extract these):
+- "User feels more confident about programming"
+- "Sarah is excited about the AI project"
+- "User is more creative in the morning"
+- "Working out improves mood"
+- "Coffee meeting planned for Tuesday"
 
-GOOD FACTS (durable, insightful):
-- "Sarah is excited about AI technology"
-- "User is more productive in morning hours"
-- "Sarah works on the same project as user"
+🚫 REJECT if:
+- Purely momentary with no lasting meaning
+- Doesn't relate to identity, behavior, relationships, or goals
+- Has no entity or topic reference
 
-BAD FACTS (just restating events):
-- "User had a meeting with Sarah"
-- "User went to coffee shop"
-- "User discussed the project"
+QUANTITY RULES:
+- MINIMUM: 3 facts if any meaningful content exists
+- MAXIMUM: 8 facts per processing run
+- NEVER return zero unless journal is literally empty
 
-TARGET: 3-6 high-quality facts total, not one per sentence.
+ENTITY ASSIGNMENT:
+- Facts ABOUT a person → assign to that person's entity
+- Facts about the user → assign to "Self"
+- "Sarah is excited" → entityName: "Sarah"
+- "I feel confident" → entityName: "Self"
 
 Return JSON: { "facts": [...] }`;
 
-    const userPrompt = `Extract ONLY the most salient, durable facts from these journals.
+    const userPrompt = `Extract 3-8 meaningful facts from these journals.
 
-KNOWN ENTITIES:
-- ${entityList}
+KNOWN ENTITIES: ${entityList || 'Self'}
 
-EXISTING FACTS (don't duplicate similar ones):
-${existingFactContents || 'none yet'}
+EXISTING FACTS (don't duplicate): ${existingFactContents || 'none yet'}
 
 JOURNALS:
 ${journalText}
 
-Extract 3-6 facts MAX that provide real insight. Skip event summaries.
+Extract facts that would matter tomorrow. Assign each to the correct entity.
 
 For each fact return:
 {
-  "content": "Durable insight (8-15 words)",
-  "entityName": "Entity this fact is ABOUT",
-  "category": "biographical|preference|belief|relationship|habit|health|emotional|progress|insight|skill",
-  "confidence": 0.0-1.0,
-  "temporality": "current|past|permanent",
-  "relatedEntities": ["other entities involved"]
+  "content": "Atomic fact statement (8-15 words)",
+  "entityName": "Entity this is ABOUT (or 'Self')",
+  "category": "emotional|insight|progress|relationship|habit|preference|plan",
+  "confidence": 0.5-1.0,
+  "temporality": "current|permanent",
+  "relatedEntities": ["other entities mentioned"]
 }`;
 
     try {
@@ -538,41 +534,38 @@ For each fact return:
   // ============================================================================
 
   async processOpenLoops(journalText, entities, existingLoops) {
-    console.log('🔄 [CRS] Extracting open loops...');
+    console.log('🔄 [CRS] Extracting open loops (v3 balanced)...');
 
     const entityList = entities.map(e => e.name).join(', ');
     const existingLoopTitles = existingLoops.filter(l => l.status === 'open').map(l => `- ${l.title}`).join('\n');
     
     const systemPrompt = `You are a cognitive memory system extracting OPEN LOOPS from personal journals.
 
-BE SELECTIVE - only extract CONCRETE action items or decisions, not vague concerns.
+OPEN LOOP RULES (v3 Balanced):
 
-OPEN LOOP = something specific that needs resolution:
-- Scheduled meeting/event coming up
-- Decision that must be made
-- Task with a deadline
-- Commitment to someone
-- Question awaiting answer
+✅ CREATE a loop if:
+- A meeting/event is planned (meeting Tuesday, coffee next week)
+- A decision is pending (need to decide, should I...)
+- A follow-up is needed (check back, email, call)
+- A task is implied (prepare, send, review, discuss)
+- A commitment was made (promised to, agreed to)
 
-DO NOT EXTRACT:
-- Vague feelings ("I should exercise more")
-- General concerns ("worried about work")
-- Ongoing situations without action item
-- Things already in existing loops
+🚫 DO NOT create loops for:
+- Emotional states alone (feeling anxious)
+- Vague intentions (should work out more)
+- Habits or routines (need to sleep better)
+- Ideas without action (would be nice to...)
 
-LOOP TYPES:
-- task: Something specific to do
-- decision: A choice to make
-- followup: Something to check on
-- commitment: A promise made
-
-TARGET: 0-2 loops per processing run. If nothing concrete, return empty array.
+QUANTITY RULES:
+- MINIMUM: 1 loop if any plan or commitment is mentioned
+- MAXIMUM: 2 loops per processing run
+- If semantically similar to existing loop → skip (don't duplicate)
 
 Return JSON: { "loops": [...] }`;
 
-    const userPrompt = `Extract ONLY concrete open loops with clear next actions.
+    const userPrompt = `Extract 1-2 open loops if any plans/commitments exist.
 
-EXISTING OPEN LOOPS (do not duplicate):
+EXISTING OPEN LOOPS (don't duplicate):
 ${existingLoopTitles || 'none'}
 
 KNOWN ENTITIES: ${entityList || 'none'}
@@ -580,15 +573,15 @@ KNOWN ENTITIES: ${entityList || 'none'}
 JOURNALS:
 ${journalText}
 
-Return 0-2 loops MAX. Must be concrete with clear action.
+If a meeting, task, or commitment is mentioned, extract it as a loop.
 
 For each loop return:
 {
-  "title": "Specific action item (e.g., 'Coffee meeting with Sarah Tuesday')",
+  "title": "Concrete action (e.g., 'Coffee meeting with Sarah Tuesday')",
   "loopType": "task|decision|followup|commitment",
   "priority": 1-3,
   "relatedEntities": ["entity names"],
-  "dueDate": "if mentioned (YYYY-MM-DD or 'this week' etc)"
+  "dueDate": "if mentioned"
 }`;
 
     try {
@@ -641,43 +634,46 @@ For each loop return:
   // ============================================================================
 
   async processPatterns(journalText, facts, existingPatterns) {
-    console.log('🔍 [CRS] Detecting patterns...');
+    console.log('🔍 [CRS] Detecting patterns (v3 balanced)...');
 
     const factSummary = facts.slice(-30).map(f => `[${f.category}] ${f.content}`).join('\n');
-    const existingPatternClaims = existingPatterns.map(p => `- ${p.claim}`).join('\n');
+    const existingPatternClaims = existingPatterns.map(p => `- ${p.claim} (${p.status})`).join('\n');
     
     const systemPrompt = `You are a cognitive memory system detecting BEHAVIORAL PATTERNS from personal journals.
 
-BE HIGHLY SELECTIVE - only identify patterns with clear evidence across MULTIPLE instances.
+PATTERN RULES (v3 Balanced):
 
-A PATTERN must have:
-1. RECURRENCE - seen multiple times, not just once
-2. CAUSALITY - clear trigger → outcome relationship
-3. ACTIONABILITY - user could test or act on this insight
+✅ PATTERN TYPES to look for:
+- Behavior patterns (what triggers what)
+- Emotional correlations (activities → mood)
+- Habit consistency (routines that work)
+- Time-of-day tendencies (morning creativity, evening fatigue)
+- Relationship dynamics (how interactions affect user)
 
-GOOD PATTERNS:
-- "Morning hours are most productive for creative work" (testable, recurring)
-- "Exercise improves mood for several hours after" (causal, recurring)
-- "Meetings with Sarah boost confidence" (specific, observable)
+✅ STATUS RULES:
+- ONE datapoint → status: "hypothesis" (tentative, needs validation)
+- TWO+ datapoints → status: "confirmed" (proven pattern)
 
-BAD PATTERNS (don't extract):
-- "User sometimes feels anxious" (too vague)
-- "User had a good meeting" (one-off event, not pattern)
-- "User likes coffee" (preference, not behavioral pattern)
+✅ GOOD PATTERNS:
+- "User is more creative in the morning" → hypothesis (1 mention)
+- "Working out improves mood" → hypothesis (1 mention)
+- "Meetings with Sarah boost confidence" → hypothesis (1 mention)
 
-DOMAINS:
-- productivity: Work output patterns
-- emotional: Mood/feeling patterns  
-- health: Physical/mental health patterns
-- relational: Relationship interaction patterns
+🚫 REJECT if:
+- No emotional/behavioral significance
+- Just restates a fact without insight
+- Too vague to be actionable
 
-TARGET: 1-3 high-confidence patterns MAX. If no clear patterns, return empty array.
+QUANTITY RULES:
+- MINIMUM: 1 pattern if any behavioral insight exists
+- MAXIMUM: 2 patterns per processing run
+- Hypothesis patterns are encouraged - they'll be confirmed later
 
 Return JSON: { "patterns": [...] }`;
 
-    const userPrompt = `Detect ONLY clear, recurring behavioral patterns.
+    const userPrompt = `Detect 1-2 behavioral patterns from these journals.
 
-EXISTING PATTERNS (do not duplicate or rephrase):
+EXISTING PATTERNS (don't duplicate):
 ${existingPatternClaims || 'none yet'}
 
 RECENT FACTS:
@@ -686,15 +682,15 @@ ${factSummary}
 JOURNALS:
 ${journalText}
 
-Return 1-3 patterns MAX. Each must show clear recurrence. If nothing recurring, return empty array.
+Return 1-2 patterns. Use status "hypothesis" for new patterns (they can be confirmed later).
 
 For each pattern return:
 {
-  "claim": "Concise pattern statement (10-15 words)",
+  "claim": "Pattern statement (10-15 words)",
   "domain": "productivity|emotional|health|relational",
-  "status": "provisional",
-  "strength": 0.0-1.0,
-  "evidence": ["evidence 1", "evidence 2"]
+  "status": "hypothesis|confirmed",
+  "strength": 0.5-1.0,
+  "evidence": ["evidence from journal"]
 }`;
 
     try {
@@ -740,47 +736,53 @@ For each pattern return:
   // ============================================================================
 
   async processNarratives(journalText, entities, facts, existingNarratives) {
-    console.log('📖 [CRS] Generating narratives...');
+    console.log('📖 [CRS] Generating narratives (v3 balanced)...');
 
     const peopleEntities = entities.filter(e => e.category === 'people' && e.id !== 'self');
     const projectEntities = entities.filter(e => e.category === 'projects');
     const entityNames = [...peopleEntities, ...projectEntities].map(e => e.name).join(', ');
     const existingNarrativeTopics = existingNarratives.map(n => `- ${n.topic} (${n.type})`).join('\n');
+    const factSummary = facts.slice(-10).map(f => f.content).join('; ');
     
     const systemPrompt = `You are a cognitive memory system generating NARRATIVE ARCS from personal journals.
 
-BE HIGHLY SELECTIVE - only create narratives for major ongoing storylines.
+NARRATIVE RULES (v3 Balanced):
 
-NARRATIVE TYPES:
-- relationship: A significant relationship with a specific person (combine all interactions with same person)
-- project: A named project or major goal  
-- growth: Personal development theme (combine related growth areas)
+✅ ALWAYS create narratives for:
+- Recurring people (one narrative per person)
+- Active projects (one narrative per project)
+- Ongoing personal arc (confidence, mood, creativity → combine into one)
 
-RULES:
-1. ONE narrative per person (not separate for "relationship" and "project" with same person)
-2. ONE narrative per project (not duplicates with slightly different names)
-3. Combine related themes into single narratives
-4. Max 2-3 narratives total per processing run
+✅ ONE narrative per domain:
+- Relationship/Social (combine all people interactions)
+- Work/Project (combine all project-related)
+- Personal Development (combine mood, habits, growth)
 
-GOOD NARRATIVES:
-- "Collaboration with Sarah" (combines all Sarah interactions)
-- "Career transition" (combines job search, skills, confidence)
-- "Health & fitness journey" (combines exercise, diet, energy)
+✅ NARRATIVE STRUCTURE:
+- Topic: Clear name
+- Trajectory: stable | improving | declining | uncertain
+- Summary: 1-2 compact sentences (like a memory index card)
+- Key challenge (if any)
 
-BAD NARRATIVES (too fragmented):
-- "Relationship with Sarah" AND "Project with Sarah" (should be one)
-- "The project" AND "The new project" AND "Work project" (should be one)
-- "Confidence" AND "Programming skills" AND "Personal growth" (should be one)
+🚫 DO NOT:
+- Create one narrative per fact
+- Write verbose paragraph summaries
+- Make narratives from non-entities
+- Create overlapping narratives (Sarah relationship + Sarah project = just "Collaboration with Sarah")
 
-TRAJECTORY: improving | declining | stable | uncertain
+QUANTITY RULES:
+- MINIMUM: 1 narrative if any person or project exists
+- MAXIMUM: 3 narratives per processing run
 
 Return JSON: { "narratives": [...] }`;
 
-    const userPrompt = `Generate 1-3 HIGH-LEVEL narrative arcs. Combine related themes.
+    const userPrompt = `Generate 1-3 compact narrative arcs.
 
-KEY ENTITIES: ${entityNames || 'none yet'}
+KEY ENTITIES: ${entityNames || 'Self only'}
 
-EXISTING NARRATIVES (update these, don't create duplicates):
+RECENT FACTS: ${factSummary || 'none'}
+
+EXISTING NARRATIVES (update or merge, don't duplicate):
 ${existingNarrativeTopics || 'none yet'}
 
 JOURNALS:
@@ -788,12 +790,12 @@ ${journalText}
 
 For each narrative return:
 {
-  "topic": "Clear topic name (e.g., 'Collaboration with Sarah')",
+  "topic": "Clear topic (e.g., 'Collaboration with Sarah', 'Personal Development')",
   "type": "relationship|project|growth",
-  "summary": "1-2 sentences on current state",
+  "summary": "1-2 sentences MAX",
   "trajectory": "improving|declining|stable|uncertain",
-  "characters": ["entity names involved"],
-  "currentChallenge": "Main challenge (if any)"
+  "characters": ["entity names"],
+  "currentChallenge": "Main challenge or null"
 }`;
 
     try {
