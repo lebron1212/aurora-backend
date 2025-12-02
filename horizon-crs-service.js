@@ -1190,6 +1190,7 @@ For each narrative return:
   async writeFile(path, data) {
     try {
       const content = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+      console.log(`💾 [CRS] Writing ${path}: ${content.length} bytes`);
       
       const { error } = await supabase.storage
         .from('horizon-files')
@@ -1199,7 +1200,26 @@ For each narrative return:
         });
 
       if (error) {
+        console.error(`❌ [CRS] Supabase write error for ${path}:`, error);
         throw error;
+      }
+
+      // Verify the write worked by reading it back
+      console.log(`🔍 [CRS] Verifying write for ${path}...`);
+      const { data: verification, error: readError } = await supabase.storage
+        .from('horizon-files')
+        .download(path);
+      
+      if (readError) {
+        console.error(`❌ [CRS] Verification read failed:`, readError);
+      } else if (verification) {
+        const writtenContent = await verification.text();
+        console.log(`✅ [CRS] Verified write ${path}: ${writtenContent.length} bytes written`);
+        if (writtenContent.length !== content.length) {
+          console.error(`⚠️ [CRS] SIZE MISMATCH! Expected ${content.length}, got ${writtenContent.length}`);
+        }
+      } else {
+        console.error(`❌ [CRS] Verification failed - no data returned for ${path}`);
       }
 
       return true;
