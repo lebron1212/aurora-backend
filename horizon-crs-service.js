@@ -95,6 +95,54 @@ class HorizonCRSService {
   constructor() {
     this.isProcessing = false;
     this.lastProcessingTime = null;
+    this.fileLocks = new Map(); // ADD THIS LINE
+  }
+
+  /**
+   * Acquire a lock for a specific file path
+   * Returns a release function that must be called when done
+   */
+  async acquireFileLock(filePath) {
+    // If there's already a lock for this file, wait for it
+    while (this.fileLocks.has(filePath)) {
+      await this.fileLocks.get(filePath);
+    }
+    
+    // Create a new lock
+    let releaseLock;
+    const lockPromise = new Promise(resolve => {
+      releaseLock = resolve;
+    });
+    this.fileLocks.set(filePath, lockPromise);
+    
+    // Return the release function
+    return () => {
+      this.fileLocks.delete(filePath);
+      releaseLock();
+    };
+  }
+
+  /**
+   * Atomic read-modify-write operation for JSON files
+   * Prevents race conditions when multiple operations target the same file
+   */
+  async atomicUpdate(filePath, updateFn) {
+    const release = await this.acquireFileLock(filePath);
+    
+    try {
+      // Read current data
+      const currentData = await this.readFile(filePath) || {};
+      
+      // Apply the update function
+      const newData = await updateFn(currentData);
+      
+      // Write back
+      await this.writeFile(filePath, newData);
+      
+      return newData;
+    } finally {
+      release();
+    }
   }
 
   /**

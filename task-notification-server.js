@@ -880,16 +880,15 @@ app.post('/sync-journals', async (req, res) => {
   }
   
   try {
-    // Load existing journal data from Supabase
-    let storedJournals = await horizonCRS.readFile('journals.json') || {};
-    console.log(`📊 [SYNC] Before sync: ${Object.keys(storedJournals).length} dates stored: [${Object.keys(storedJournals).join(', ')}]`);
+    // Use atomic update to prevent race conditions
+    const storedJournals = await horizonCRS.atomicUpdate('journals.json', async (existing) => {
+      console.log(`📊 [SYNC] Before sync: ${Object.keys(existing).length} dates stored: [${Object.keys(existing).join(', ')}]`);
+      console.log(`📝 [SYNC] Adding ${date} with ${journals.length} entries (${journals.reduce((sum, j) => sum + (j.content?.length || 0), 0)} chars)`);
+      
+      existing[date] = journals;
+      return existing;
+    });
     
-    // Store journals by date
-    storedJournals[date] = journals;
-    console.log(`📝 [SYNC] Adding ${date} with ${journals.length} entries (${journals.reduce((sum, j) => sum + (j.content?.length || 0), 0)} chars)`);
-    
-    // Write back to Supabase
-    await horizonCRS.writeFile('journals.json', storedJournals);
     console.log(`✅ [SYNC] After sync: ${Object.keys(storedJournals).length} dates stored: [${Object.keys(storedJournals).join(', ')}]`);
     
     if (isInitialSync) {
@@ -918,25 +917,23 @@ app.post('/sync-conversations', async (req, res) => {
   }
   
   try {
-    // Load existing conversation data from Supabase
-    let stored = await horizonCRS.readFile('conversations.json') || {};
-    
-    // Store by date, deduplicate by conversation ID
-    if (!stored[date]) {
-      stored[date] = [];
-    }
-    
-    for (const conv of conversations) {
-      const existingIndex = stored[date].findIndex(c => c.id === conv.id);
-      if (existingIndex >= 0) {
-        stored[date][existingIndex] = conv; // Update
-      } else {
-        stored[date].push(conv); // Add new
+    // Use atomic update to prevent race conditions
+    const stored = await horizonCRS.atomicUpdate('conversations.json', async (existing) => {
+      if (!existing[date]) {
+        existing[date] = [];
       }
-    }
-    
-    // Write back to Supabase
-    await horizonCRS.writeFile('conversations.json', stored);
+      
+      for (const conv of conversations) {
+        const existingIndex = existing[date].findIndex(c => c.id === conv.id);
+        if (existingIndex >= 0) {
+          existing[date][existingIndex] = conv;
+        } else {
+          existing[date].push(conv);
+        }
+      }
+      
+      return existing;
+    });
     
     console.log(`💬 [SYNC] Stored ${conversations.length} conversations for ${date}`);
     res.json({ 
