@@ -1192,16 +1192,11 @@ For each narrative return:
       const content = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
       console.log(`💾 [CRS] Writing ${path}: ${content.length} bytes`);
       
-      // Use Buffer with explicit UTF-8 encoding
-      const buffer = Buffer.from(content, 'utf8');
-      console.log(`🔄 [CRS] Buffer size: ${buffer.length} bytes vs string size: ${content.length}`);
-      
       const { error } = await supabase.storage
         .from('horizon-files')
-        .upload(path, buffer, { 
-          contentType: 'application/json; charset=utf-8',
-          upsert: true,
-          duplex: 'half'
+        .upload(path, content, { 
+          contentType: 'application/json',
+          upsert: true 
         });
 
       if (error) {
