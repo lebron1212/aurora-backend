@@ -1485,11 +1485,12 @@ async function processJournalsForDate(date, journals) {
     // Update stats file
     fs.writeFileSync(PROCESSING_STATS_FILE, JSON.stringify(stats, null, 2));
     
-    // Send notification about processing completion
-    if (server.deviceTokens.length > 0) {
-      const { title, body } = createInsightfulNotification(extractions, insights, journals.length, date);
-      await server.sendImmediateNotification(title, body);
-    }
+    // Processing completion notifications disabled
+    // Users don't want automatic notifications when journal processing runs
+    // if (server.deviceTokens.length > 0) {
+    //   const { title, body } = createInsightfulNotification(extractions, insights, journals.length, date);
+    //   await server.sendImmediateNotification(title, body);
+    // }
     
     console.log(`✅ [NIGHTLY] Completed processing for ${date} in ${result.processingTime}ms`);
     return result;
