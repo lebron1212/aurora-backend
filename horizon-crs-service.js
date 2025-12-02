@@ -1187,47 +1187,104 @@ For each narrative return:
     }
   }
 
-  async writeFile(path, data) {
-    try {
-      const content = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
-      console.log(`💾 [CRS] Writing ${path}: ${content.length} bytes`);
-      
-      const { error } = await supabase.storage
-        .from('horizon-files')
-        .upload(path, content, { 
-          contentType: 'application/json',
-          upsert: true 
-        });
+async writeFile(path, data) {
+  try {
+    const content = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
+    const contentType = path.endsWith('.json') ? 'application/json' : 'text/plain';
+    console.log(`💾 [CRS] Writing ${path}: ${content.length} bytes`);
+    
+    // Convert string to Blob - this is critical for Supabase Storage
+    const blob = new Blob([content], { type: contentType });
+    
+    // First, try to remove existing file to avoid upsert issues
+    await supabase.storage
+      .from('horizon-files')
+      .remove([path]);
+    
+    // Upload the blob
+    const { error } = await supabase.storage
+      .from('horizon-files')
+      .upload(path, blob, { 
+        contentType: contentType,
+        upsert: true
+      });
 
-      if (error) {
-        console.error(`❌ [CRS] Supabase write error for ${path}:`, error);
-        throw error;
-      }
-
-      // Verify the write worked by reading it back
-      console.log(`🔍 [CRS] Verifying write for ${path}...`);
-      const { data: verification, error: readError } = await supabase.storage
-        .from('horizon-files')
-        .download(path);
-      
-      if (readError) {
-        console.error(`❌ [CRS] Verification read failed:`, readError);
-      } else if (verification) {
-        const writtenContent = await verification.text();
-        console.log(`✅ [CRS] Verified write ${path}: ${writtenContent.length} bytes written`);
-        if (writtenContent.length !== content.length) {
-          console.error(`⚠️ [CRS] SIZE MISMATCH! Expected ${content.length}, got ${writtenContent.length}`);
-        }
-      } else {
-        console.error(`❌ [CRS] Verification failed - no data returned for ${path}`);
-      }
-
-      return true;
-    } catch (error) {
-      console.error(`❌ [CRS] Failed to write file ${path}:`, error.message);
+    if (error) {
+      console.error(`❌ [CRS] Supabase write error for ${path}:`, error);
       throw error;
     }
+
+    // Verify the write worked by reading it back
+    console.log(`🔍 [CRS] Verifying write for ${path}...`);
+    
+    // Small delay to allow for eventual consistency
+    await new Promise(resolve => setTimeout(resolve, 100));
+    
+    const { data: verification, error: readError } = await supabase.storage
+      .from('horizon-files')
+      .download(path);
+    
+    if (readError) {
+      console.error(`❌ [CRS] Verification read failed:`, readError);
+      return true; // Upload succeeded, verification failed - may be timing
+    }
+    
+    if (verification) {
+      const writtenContent = await verification.text();
+      console.log(`✅ [CRS] Verified write ${path}: ${writtenContent.length} bytes written`);
+      
+      if (writtenContent.length !== content.length) {
+        console.error(`⚠️ [CRS] SIZE MISMATCH! Expected ${content.length}, got ${writtenContent.length}`);
+        
+        // Retry with explicit remove + upload
+        console.log(`🔧 [CRS] Retrying with delete-then-upload...`);
+        
+        const { error: removeError } = await supabase.storage
+          .from('horizon-files')
+          .remove([path]);
+          
+        if (removeError) {
+          console.warn(`⚠️ [CRS] Remove before retry failed:`, removeError.message);
+        }
+        
+        // Wait for deletion to propagate
+        await new Promise(resolve => setTimeout(resolve, 200));
+        
+        const retryBlob = new Blob([content], { type: contentType });
+        const { error: retryError } = await supabase.storage
+          .from('horizon-files')
+          .upload(path, retryBlob, { 
+            contentType: contentType
+          });
+          
+        if (retryError) {
+          console.error(`❌ [CRS] Retry upload failed:`, retryError);
+          throw retryError;
+        }
+        
+        // Verify retry
+        await new Promise(resolve => setTimeout(resolve, 100));
+        const { data: retryVerify } = await supabase.storage
+          .from('horizon-files')
+          .download(path);
+          
+        if (retryVerify) {
+          const retryContent = await retryVerify.text();
+          if (retryContent.length === content.length) {
+            console.log(`✅ [CRS] Retry succeeded: ${retryContent.length} bytes verified`);
+          } else {
+            console.error(`❌ [CRS] Retry still has size mismatch: expected ${content.length}, got ${retryContent.length}`);
+          }
+        }
+      }
+    }
+
+    return true;
+  } catch (error) {
+    console.error(`❌ [CRS] Failed to write file ${path}:`, error.message);
+    throw error;
   }
+}
 
   async readFile(path) {
     try {
