@@ -205,10 +205,16 @@ class HorizonCRSService {
     // Flatten journals by date into array
     const allJournals = [];
     for (const [date, entries] of Object.entries(journals)) {
+      console.log(`🗓️ [CRS] Processing date ${date}: ${entries?.length || 0} entries`);
+      if (entries && entries.length > 0) {
+        const totalChars = entries.reduce((sum, e) => sum + (e.content?.length || 0), 0);
+        console.log(`📊 [CRS] Date ${date}: ${totalChars} total characters`);
+      }
       for (const entry of entries) {
         allJournals.push({ ...entry, date });
       }
     }
+    console.log(`📈 [CRS] Total journal entries loaded: ${allJournals.length}`)
 
     // Flatten conversations by date into array
     const allConversations = [];
@@ -253,9 +259,17 @@ class HorizonCRSService {
 
     // Combine journal content for processing
     const recentJournals = rawData.journals.slice(-30); // Last 30 entries
+    console.log(`📝 [CRS] Processing ${recentJournals.length} journal entries`);
+    recentJournals.forEach((j, i) => {
+      const contentLength = (j.content || j.text || '').length;
+      console.log(`  ${i+1}. [${j.date}] ${contentLength} chars: "${(j.content || j.text || '').substring(0, 50)}..."`);
+    });
+    
     const journalText = recentJournals
       .map(j => `[${j.date}] ${j.content || j.text || ''}`)
       .join('\n\n');
+
+    console.log(`📖 [CRS] Total journal text length: ${journalText.length} characters`);
 
     if (!journalText.trim()) {
       console.log('⚠️ [CRS] No journal content to process');
