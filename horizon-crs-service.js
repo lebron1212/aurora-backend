@@ -1198,13 +1198,35 @@ For each narrative return:
   async readFile(path) {
     try {
       console.log(`🔍 [CRS] Attempting to read file: ${path}`);
+      
+      // Try method 1: Direct download
       const { data, error } = await supabase.storage
         .from('horizon-files')
         .download(path);
 
       if (error) {
         console.error(`❌ [CRS] Supabase download error for ${path}:`, error);
-        return null;
+        console.log(`🔄 [CRS] Trying alternative method with public URL...`);
+        
+        // Try method 2: Create signed URL and fetch
+        const { data: urlData, error: urlError } = await supabase.storage
+          .from('horizon-files')
+          .createSignedUrl(path, 60); // 60 second expiry
+          
+        if (urlError || !urlData?.signedUrl) {
+          console.error(`❌ [CRS] Failed to create signed URL:`, urlError);
+          return null;
+        }
+        
+        console.log(`📡 [CRS] Fetching via signed URL: ${urlData.signedUrl}`);
+        const response = await fetch(urlData.signedUrl);
+        if (!response.ok) {
+          console.error(`❌ [CRS] HTTP ${response.status}: ${response.statusText}`);
+          return null;
+        }
+        
+        const text = await response.text();
+        return JSON.parse(text);
       }
 
       if (!data) {
