@@ -873,33 +873,61 @@ const CONVERSATIONS_FILE = path.join(__dirname, 'conversations.json');
 
 // Store journal data for nightly processing
 app.post('/sync-journals', async (req, res) => {
-  const { journals, date, isInitialSync = false } = req.body;
+  const { journals, date, deletedIds, isInitialSync = false } = req.body;
   
-  if (!journals || !date) {
-    return res.status(400).json({ error: 'Journals array and date required' });
+  if (!date) {
+    return res.status(400).json({ error: 'Date required' });
   }
   
   try {
     // Use atomic update to prevent race conditions
     const storedJournals = await horizonCRS.atomicUpdate('journals.json', async (existing) => {
-      console.log(`📊 [SYNC] Before sync: ${Object.keys(existing).length} dates stored: [${Object.keys(existing).join(', ')}]`);
-      console.log(`📝 [SYNC] Adding ${date} with ${journals.length} entries (${journals.reduce((sum, j) => sum + (j.content?.length || 0), 0)} chars)`);
+      console.log(`📊 [SYNC] Before sync: ${Object.keys(existing).length} dates stored`);
       
-      existing[date] = journals;
+      // Initialize date array if needed
+      if (!existing[date]) {
+        existing[date] = [];
+      }
+      
+      // Handle deletions
+      if (deletedIds && deletedIds.length > 0) {
+        console.log(`🗑️ [SYNC] Removing ${deletedIds.length} entries: ${deletedIds.join(', ')}`);
+        existing[date] = existing[date].filter(entry => !deletedIds.includes(entry.id));
+      }
+      
+      // Handle upserts
+      if (journals && journals.length > 0) {
+        for (const journal of journals) {
+          const existingIndex = existing[date].findIndex(e => e.id === journal.id);
+          
+          if (existingIndex >= 0) {
+            // Update existing entry
+            console.log(`📝 [SYNC] Updating entry ${journal.id}: ${journal.content?.length || 0} chars`);
+            existing[date][existingIndex] = journal;
+          } else {
+            // Add new entry
+            console.log(`➕ [SYNC] Adding new entry ${journal.id}: ${journal.content?.length || 0} chars`);
+            existing[date].push(journal);
+          }
+        }
+      }
+      
+      // Clean up empty dates
+      if (existing[date].length === 0) {
+        delete existing[date];
+        console.log(`🧹 [SYNC] Removed empty date ${date}`);
+      }
+      
       return existing;
     });
     
-    console.log(`✅ [SYNC] After sync: ${Object.keys(storedJournals).length} dates stored: [${Object.keys(storedJournals).join(', ')}]`);
-    
-    if (isInitialSync) {
-      console.log(`📚 [SYNC] Initial sync: Stored ${journals.length} journals for ${date}`);
-    } else {
-      console.log(`📝 [SYNC] Synced ${journals.length} journals for ${date}`);
-    }
+    const entriesForDate = storedJournals[date]?.length || 0;
+    console.log(`✅ [SYNC] After sync: ${entriesForDate} entries for ${date}, ${Object.keys(storedJournals).length} total dates`);
     
     res.json({ 
       success: true, 
-      message: `Stored ${journals.length} journals for ${date}`,
+      message: `Synced journals for ${date}`,
+      entriesForDate,
       storedDates: Object.keys(storedJournals).length
     });
   } catch (error) {
