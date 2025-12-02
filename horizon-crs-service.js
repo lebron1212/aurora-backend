@@ -154,16 +154,18 @@ class HorizonCRSService {
     // Ensure system directories exist in storage
     await this.ensureSystemDirectories();
     
-    // Start nightly cron job at 2 AM
-    cron.schedule('0 2 * * *', async () => {
-      console.log('🌙 [CRS] Starting nightly processing...');
+    // Start nightly cron job at 2 AM PST (10 AM UTC)
+    // Railway servers run in UTC, so we need to adjust: 2 AM PST = 10 AM UTC
+    cron.schedule('0 10 * * *', async () => {
+      const pstTime = new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' });
+      console.log(`🌙 [CRS] Starting nightly processing at ${pstTime} PST...`);
       await this.runNightlyProcessing();
     });
 
     // Optional: Add a manual trigger endpoint for testing
     this.setupManualTrigger();
 
-    console.log('✅ [CRS] Service initialized. Nightly processing scheduled for 2 AM.');
+    console.log('✅ [CRS] Service initialized. Nightly processing scheduled for 2 AM PST (10 AM UTC).');
   }
 
   /**
