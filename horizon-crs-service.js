@@ -1197,21 +1197,26 @@ For each narrative return:
 
   async readFile(path) {
     try {
+      console.log(`🔍 [CRS] Attempting to read file: ${path}`);
       const { data, error } = await supabase.storage
         .from('horizon-files')
         .download(path);
 
-      if (error || !data) {
+      if (error) {
+        console.error(`❌ [CRS] Supabase download error for ${path}:`, error);
         return null;
       }
 
+      if (!data) {
+        console.warn(`⚠️ [CRS] No data returned for ${path}`);
+        return null;
+      }
+
+      console.log(`✅ [CRS] Successfully downloaded ${path}, size: ${data.size} bytes`);
       const text = await data.text();
       return JSON.parse(text);
     } catch (error) {
-      // Don't log for expected "not found" cases
-      if (!error.message?.includes('not found')) {
-        console.error(`❌ [CRS] Failed to read file ${path}:`, error.message);
-      }
+      console.error(`❌ [CRS] Failed to read file ${path}:`, error.message);
       return null;
     }
   }
