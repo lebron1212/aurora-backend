@@ -289,25 +289,31 @@ class HorizonCRSService {
     
     const systemPrompt = `You are a cognitive memory system extracting ENTITIES from personal journals.
 
-ENTITY TYPES:
-- people: Named individuals (friends, family, colleagues, doctors, etc.)
-- projects: Named projects, goals, or ongoing efforts
-- places: Specific locations (cities, offices, restaurants, etc.)
-- concepts: Important abstract concepts, values, or themes
+BE AGGRESSIVE - extract ANY named person, project, or place. When in doubt, CREATE the entity.
 
-RULES:
-1. Extract SPECIFIC named entities, not generic terms
-2. Include aliases (nicknames, abbreviations)
-3. Determine salience (0.0-1.0) based on importance/frequency
-4. Category must be one of: people, projects, places, concepts
-5. Skip generic terms like "work", "home" unless they're clearly named entities
+ENTITY TYPES (in order of priority):
+1. people: ANY named person mentioned (Sarah, Dr. Smith, Mom, Mike, etc.) - ALWAYS extract these
+2. projects: Named projects, goals, initiatives ("the website redesign", "my fitness journey")
+3. places: Specific locations (cities, restaurants, offices, "the gym", "downtown office")
+4. concepts: Important recurring themes or values
+
+CRITICAL RULES:
+1. EVERY person name = new entity. No exceptions. Sarah mentioned once? Create Sarah entity.
+2. If someone is mentioned by name, they are important enough to be an entity
+3. Projects don't need formal names - "the project" or "work project" counts if discussed
+4. Err on the side of MORE entities, not fewer
+5. Salience: 0.9+ for people discussed in detail, 0.7+ for anyone mentioned by name
 
 Return JSON: { "entities": [...] }`;
 
-    const userPrompt = `Extract entities from these journal entries. Return NEW entities not in this existing list: ${existingNames.join(', ')}
+    const userPrompt = `Extract ALL entities from these journals. Be aggressive - any named person MUST become an entity.
+
+EXISTING ENTITIES (update these if mentioned again): ${existingNames.join(', ') || 'none yet'}
 
 JOURNALS:
 ${journalText}
+
+IMPORTANT: If you see a name like "Sarah", "Mike", "Dr. Johnson" - that is a PERSON entity. Create it.
 
 For each entity return:
 {
@@ -315,22 +321,24 @@ For each entity return:
   "category": "people|projects|places|concepts",
   "aliases": ["nickname", "abbreviation"],
   "salience": 0.0-1.0,
-  "description": "Brief description based on journal context"
+  "description": "Who/what this is based on journal context",
+  "relationshipToSelf": "friend|family|colleague|doctor|acquaintance|none (for non-people)"
 }`;
 
     try {
       const result = await callOpenAI(systemPrompt, userPrompt);
       const newEntities = (result.entities || []).map(e => ({
-        id: `entity_${slugify(e.name)}_${generateId()}`,
+        id: `entity_${slugify(e.name)}`,
         name: e.name,
         category: e.category || 'concepts',
         aliases: e.aliases || [],
-        salience: e.salience || 0.5,
+        salience: e.salience || 0.7,
         description: e.description || '',
+        relationshipToSelf: e.relationshipToSelf || null,
         lastMentionedAt: Date.now(),
         mentionCount: 1,
         factIds: [],
-        relationshipGraph: [],
+        relationshipGraph: e.category === 'people' ? [{ entityId: 'self', relationship: e.relationshipToSelf || 'known', strength: e.salience || 0.7 }] : [],
         decayRate: 0.01,
         lastDecayAt: Date.now(),
         createdAt: Date.now(),
@@ -339,14 +347,16 @@ For each entity return:
 
       // Ensure self entity exists
       const allEntities = [...existingEntities];
-      if (!allEntities.find(e => e.id === 'self' || e.name.toLowerCase() === 'self')) {
-        allEntities.push({
+      let selfEntity = allEntities.find(e => e.id === 'self' || e.name.toLowerCase() === 'self');
+      if (!selfEntity) {
+        selfEntity = {
           id: 'self',
           name: 'Self',
           category: 'people',
           aliases: ['I', 'me', 'myself'],
           salience: 1.0,
           description: 'The user themselves',
+          relationshipToSelf: null,
           lastMentionedAt: Date.now(),
           mentionCount: 1,
           factIds: [],
@@ -355,21 +365,38 @@ For each entity return:
           lastDecayAt: Date.now(),
           createdAt: Date.now(),
           updatedAt: Date.now()
-        });
+        };
+        allEntities.push(selfEntity);
       }
 
-      // Merge new entities (avoid duplicates)
+      // Merge new entities (avoid duplicates) and build Self's relationship graph
       for (const newEntity of newEntities) {
-        const exists = allEntities.find(e => 
+        const existingIndex = allEntities.findIndex(e => 
           e.name.toLowerCase() === newEntity.name.toLowerCase()
         );
-        if (!exists) {
+        if (existingIndex === -1) {
           allEntities.push(newEntity);
+          
+          // Add to Self's relationship graph if it's a person
+          if (newEntity.category === 'people' && selfEntity) {
+            const existingRelation = selfEntity.relationshipGraph.find(r => r.entityId === newEntity.id);
+            if (!existingRelation) {
+              selfEntity.relationshipGraph.push({
+                entityId: newEntity.id,
+                relationship: newEntity.relationshipToSelf || 'known',
+                strength: newEntity.salience || 0.7
+              });
+            }
+          }
         } else {
           // Update existing entity
-          exists.lastMentionedAt = Date.now();
-          exists.mentionCount = (exists.mentionCount || 0) + 1;
-          exists.updatedAt = Date.now();
+          allEntities[existingIndex].lastMentionedAt = Date.now();
+          allEntities[existingIndex].mentionCount = (allEntities[existingIndex].mentionCount || 0) + 1;
+          allEntities[existingIndex].updatedAt = Date.now();
+          // Update salience if new one is higher
+          if (newEntity.salience > (allEntities[existingIndex].salience || 0)) {
+            allEntities[existingIndex].salience = newEntity.salience;
+          }
         }
       }
 
@@ -389,43 +416,59 @@ For each entity return:
   async processFacts(journalText, entities, existingFacts) {
     console.log('📝 [CRS] Extracting facts...');
 
-    const entityList = entities.map(e => `${e.name} (${e.category})`).join(', ');
+    const entityList = entities.map(e => `${e.name} (${e.category}, id: ${e.id})`).join('\n- ');
     
-    const systemPrompt = `You are a cognitive memory system extracting FACTS from personal journals.
+    const systemPrompt = `You are a cognitive memory system extracting ATOMIC FACTS from personal journals.
 
-A FACT is an atomic, timestamped truth about the user or their world.
+CRITICAL: Facts belong to the entity they are ABOUT, not the narrator.
+- "Sarah is excited about AI" → entityName: "Sarah" (it's about Sarah)
+- "I feel anxious" → entityName: "Self" (it's about the user)
+- "Sarah and I had coffee" → entityName: "Self" BUT relatedEntities: ["Sarah"] (user's action, Sarah involved)
+- "Sarah suggested meditation" → entityName: "Sarah" (Sarah's action/attribute)
 
 FACT CATEGORIES:
-- self: Facts about the user (beliefs, preferences, identity)
-- relationship: Facts about relationships with others
-- habit: Behavioral patterns or routines
-- health: Physical or mental health observations
-- emotional: Emotional states or reactions
-- progress: Progress on goals or projects
+- biographical: Who someone is, their role, background
+- preference: What someone likes/dislikes
+- belief: What someone believes or values  
+- relationship: How two entities relate to each other
+- habit: Behavioral patterns
+- health: Physical or mental health
+- emotional: Emotional states
+- progress: Progress on goals
 - insight: Realizations or learnings
-- event: Specific events that happened
+- skill: Abilities or expertise
 
-RULES:
-1. Facts must be SPECIFIC and ATOMIC (one truth per fact)
-2. Link facts to relevant entities by name
-3. Assign confidence (0.0-1.0) based on how certain the statement is
-4. temporality: "current" (still true), "past" (was true), "permanent" (always true)
+ATOMIC FACTS - break down into smallest truths:
+❌ BAD: "Had a great meeting with Sarah about the project"
+✅ GOOD: 
+  - "Sarah is involved in the project" (about Sarah)
+  - "User had a meeting with Sarah" (about Self, related: Sarah)
+  - "User feels positive about the project" (about Self)
 
 Return JSON: { "facts": [...] }`;
 
-    const userPrompt = `Extract facts from these journals. Link to these entities where relevant: ${entityList}
+    const userPrompt = `Extract ATOMIC facts from these journals.
+
+KNOWN ENTITIES:
+- ${entityList}
 
 JOURNALS:
 ${journalText}
 
+RULES:
+1. Each fact = ONE atomic truth
+2. entityName = who/what the fact is ABOUT (not who is narrating)
+3. Facts about other people go to THEIR entity, not Self
+4. Include Self in relatedEntities when the user is involved but fact is about someone else
+
 For each fact return:
 {
-  "content": "The atomic fact statement",
-  "entityName": "Primary entity this relates to (or 'Self')",
-  "category": "self|relationship|habit|health|emotional|progress|insight|event",
+  "content": "Single atomic fact (8-15 words ideal)",
+  "entityName": "The entity this fact is ABOUT",
+  "category": "biographical|preference|belief|relationship|habit|health|emotional|progress|insight|skill",
   "confidence": 0.0-1.0,
   "temporality": "current|past|permanent",
-  "relatedEntities": ["other", "related", "entity", "names"]
+  "relatedEntities": ["other entities involved or mentioned"]
 }`;
 
     try {
