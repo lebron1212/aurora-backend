@@ -675,37 +675,81 @@ Return 1-4 entities. For each:
     
     const systemPrompt = `You are a cognitive memory system extracting FACTS from personal journals.
 
-FACT RULES (v3 Balanced):
+CRITICAL: Facts belong to the entity they are ABOUT, not the narrator.
+- "Sarah is excited about AI" → entityName: "Sarah" (it's about Sarah)
+- "I feel anxious" → entityName: "Self" (it's about the user)
+- "Sarah and I had coffee" → entityName: "Self" BUT relatedEntities: ["Sarah"] (user's action, Sarah involved)
+- "Sarah suggested meditation" → entityName: "Sarah" (Sarah's action/attribute)
 
-✅ ALWAYS extract facts for:
-- How the user FEELS (emotions, mood states)
-- How the user THINKS about someone
-- Progress or changes in a project
-- Plans, decisions, or observations involving entities
-- Self-insights and realizations
+FACT CATEGORIES:
+- biographical: Who someone is, their role, background (including where they live / are from)
+- preference: What someone likes/dislikes
+- belief: What someone believes or values  
+- relationship: How two entities relate to each other
+- habit: Behavioral patterns
+- health: Physical or mental health
+- emotional: Emotional states (especially when tied to specific people/events)
+- progress: Progress on goals
+- insight: Realizations or learnings
+- skill: Abilities or expertise
+- plan: Future intentions
 
-✅ GOOD FACTS (extract these):
-- "User feels more confident about programming"
-- "Sarah is excited about the AI project"
-- "User is more creative in the morning"
-- "Working out improves mood"
-- "Coffee meeting planned for Tuesday"
+RELATIONSHIP ATTRIBUTION RULES:
+- If a sentence describes a STABLE property about another person (where they live, where they're from, what they believe, how they show up), entityName MUST be that person, not Self.
+- Facts about the user's *internal reaction* go to Self ("I felt devastated after Stella called").
+- Facts about the OTHER person's qualities, location, or role go to THEM ("Stella lives in Chicago", "Stella is from LA", "Stella is my twin flame").
 
-🚫 REJECT if:
-- Purely momentary with no lasting meaning
-- Doesn't relate to identity, behavior, relationships, or goals
-- Has no entity or topic reference
+DREAMS (IMPORTANT):
+Treat emotionally significant dreams as valid sources of facts when:
+- The dream involves a recurring person (e.g., Stella),
+- The dream has strong emotional weight,
+- OR it clearly affects the user's interpretation of the relationship.
+
+From such dreams, create:
+- Facts about the OTHER person's role in the user's inner world  
+  (e.g., "In a dream, Stella expressed relief about the relationship")
+- Facts about the USER's emotional response and interpretation  
+  (e.g., "User felt intense relief after dreaming about Stella")
+
+Mark these as:
+- category: "emotional" or "relationship"
+- temporality: "current"
+- confidence: 0.4–0.7 (they are subjective, symbolic)
+
+CORE WOUNDS & SELF-SCHEMAS:
+If the user explicitly names a wound or core pattern (e.g. "my wound is validation", "I have an abandonment wound"):
+- ALWAYS create at least one fact for Self:
+  - content: concise version of the wound
+  - category: "belief" or "insight"
+  - temporality: "current"
+- This should happen EVEN if it's only mentioned once.
+
+SYMBOLIC / SPIRITUAL RELATIONSHIP TERMS:
+Terms like "twin flame", "soulmate", "soul connection", "manifestation" are IMPORTANT belief frameworks.
+- Always store them as belief / relationship facts, even if subjective.
+- For "X is my twin flame":
+  - Create a fact for Self: "User describes X as their twin flame"
+  - Create a fact for the OTHER person with lower confidence: "X is described by the user as their twin flame"
+
+GEOGRAPHICAL FACTS (HIGH PRIORITY):
+Always extract biographical facts about where people are:
+- "Stella lives in Chicago" → entityName: "Stella", category: "biographical", temporality: "current"
+- "Stella is from LA" → entityName: "Stella", category: "biographical", temporality: "permanent" or "past"
+- "Stella will be in Chicago on Dec 8" → entityName: "Stella", category: "biographical" or "relationship", temporality: "current"
 
 QUANTITY RULES:
 - MINIMUM: 3 facts if any meaningful content exists
 - MAXIMUM: 8 facts per processing run
 - NEVER return zero unless journal is literally empty
 
-ENTITY ASSIGNMENT:
-- Facts ABOUT a person → assign to that person's entity
-- Facts about the user → assign to "Self"
-- "Sarah is excited" → entityName: "Sarah"
-- "I feel confident" → entityName: "Self"
+ATOMIC FACTS - break down into smallest truths:
+❌ BAD: "Had a great meeting with Sarah about the project"
+✅ GOOD:
+  - "Sarah is involved in the project" (about Sarah)
+  - "User had a meeting with Sarah" (about Self, related: Sarah)
+  - "User feels positive about the project" (about Self)
+
+Relationship facts can legitimately produce more than one fact (for Self and for the other entity) when both sides have meaningful attributes or beliefs.
 
 Return JSON: { "facts": [...] }`;
 
@@ -718,13 +762,19 @@ EXISTING FACTS (don't duplicate): ${existingFactContents || 'none yet'}
 JOURNALS:
 ${journalText}
 
-Extract facts that would matter tomorrow. Assign each to the correct entity.
+RULES:
+1. Each fact = ONE atomic truth
+2. entityName = who/what the fact is ABOUT (not who is narrating)
+3. Facts about other people go to THEIR entity, not Self
+4. Include Self in relatedEntities when the user is involved but fact is about someone else
+5. LOCATION facts about other people (where they live, where they are from, where they will be)
+   MUST be stored under that person's entity, even if the user is narrating it.
 
 For each fact return:
 {
   "content": "Atomic fact statement (8-15 words)",
   "entityName": "Entity this is ABOUT (or 'Self')",
-  "category": "emotional|insight|progress|relationship|habit|preference|plan",
+  "category": "biographical|emotional|insight|progress|relationship|habit|preference|plan|belief|skill|health",
   "confidence": 0.5-1.0,
   "temporality": "current|permanent",
   "relatedEntities": ["other entities mentioned"]
@@ -737,7 +787,20 @@ For each fact return:
         const entity = entities.find(e => 
           e.name.toLowerCase() === (f.entityName || 'self').toLowerCase()
         );
-        const entityId = entity?.id || 'self';
+        let entityId = entity?.id || 'self';
+
+        // Heuristic: if the fact is clearly about someone else and not written in first person,
+        // but the model still pointed it at Self, reassign it to the single related entity.
+        const contentLower = (f.content || '').toLowerCase();
+        const hasFirstPerson = /\b(i|me|my|mine|myself)\b/.test(contentLower);
+
+        if (entityId === 'self' && !hasFirstPerson && (f.relatedEntities || []).length === 1) {
+          const relatedName = f.relatedEntities[0];
+          const related = entities.find(e => e.name.toLowerCase() === relatedName.toLowerCase());
+          if (related) {
+            entityId = related.id;
+          }
+        }
 
         // Find related entity IDs
         const relatedEntityIds = (f.relatedEntities || [])
@@ -787,6 +850,15 @@ For each fact return:
     
     const systemPrompt = `You are a cognitive memory system extracting OPEN LOOPS from personal journals.
 
+An OPEN LOOP is an unresolved item that needs attention:
+- Unanswered questions
+- Pending decisions
+- Unfinished tasks
+- Unresolved conflicts
+- Things to follow up on
+- Commitments made
+- Emotionally significant dreams whose meaning or implication the user is clearly still trying to understand
+
 OPEN LOOP RULES (v3 Balanced):
 
 ✅ CREATE a loop if:
@@ -795,6 +867,7 @@ OPEN LOOP RULES (v3 Balanced):
 - A follow-up is needed (check back, email, call)
 - A task is implied (prepare, send, review, discuss)
 - A commitment was made (promised to, agreed to)
+- A significant dream's meaning remains unresolved
 
 🚫 DO NOT create loops for:
 - Emotional states alone (feeling anxious)
@@ -887,23 +960,39 @@ For each loop return:
     
     const systemPrompt = `You are a cognitive memory system detecting BEHAVIORAL PATTERNS from personal journals.
 
-PATTERN RULES (v3 Balanced):
+A PATTERN is a recurring behavioral or emotional regularity:
+- Triggers that cause certain states
+- Time-based patterns (e.g., "stressed on Sunday nights")
+- Correlations between activities and outcomes
+- Repeated behaviors or reactions
+- Cause-and-effect relationships
 
-✅ PATTERN TYPES to look for:
-- Behavior patterns (what triggers what)
-- Emotional correlations (activities → mood)
-- Habit consistency (routines that work)
-- Time-of-day tendencies (morning creativity, evening fatigue)
-- Relationship dynamics (how interactions affect user)
+Pay special attention to:
+- Repeated dreams about the SAME person that clearly affect mood, decisions, or clarity.
+- Shifts in confidence, authenticity, or behavior after emotionally intense dreams.
 
-✅ STATUS RULES:
+PATTERN STATUS:
 - ONE datapoint → status: "hypothesis" (tentative, needs validation)
 - TWO+ datapoints → status: "confirmed" (proven pattern)
 
-✅ GOOD PATTERNS:
-- "User is more creative in the morning" → hypothesis (1 mention)
-- "Working out improves mood" → hypothesis (1 mention)
-- "Meetings with Sarah boost confidence" → hypothesis (1 mention)
+DOMAINS:
+- emotional: Mood patterns and emotional dynamics
+- behavioral: Action patterns and habits
+- relational: Patterns in relationships
+- productivity: Work and focus patterns
+- health: Physical and mental health correlations
+- creative: Creative flow patterns
+
+ALWAYS CREATE AT LEAST ONE PATTERN WHEN:
+- The user explicitly names a "wound", "core wound", or self-schema (e.g. "my wound is validation").
+  This should become a provisional pattern in the "emotional" or "relational" domain, even if only mentioned once,
+  with moderate strength (e.g. 0.3–0.6) and clear evidence.
+
+Also treat symbolic / spiritual frameworks (e.g. "twin flame", "soulmate", "manifestation laws")
+as BEHAVIORALLY IMPORTANT: they shape how the user interprets events and makes decisions.
+If such a framework appears even once AND influences how the user thinks about a relationship
+or life path, you may create a low-to-moderate strength pattern describing how this framework
+affects behavior or expectations.
 
 🚫 REJECT if:
 - No emotional/behavioral significance
@@ -991,6 +1080,16 @@ For each pattern return:
     const factSummary = facts.slice(-10).map(f => f.content).join('; ');
     
     const systemPrompt = `You are a cognitive memory system generating NARRATIVE ARCS from personal journals.
+
+A NARRATIVE is a story arc that tracks development over time:
+- Relationship arcs (how a relationship is evolving)
+- Project/goal arcs (progress toward something)
+- Personal growth arcs (self-development journeys)
+- Challenge arcs (dealing with difficulties)
+
+Emotionally intense dreams that change how the user FEELS about a person or situation
+should be treated as KEY MOMENTS in the relevant relationship or growth narrative,
+not ignored as noise.
 
 NARRATIVE RULES (v3 Balanced):
 
