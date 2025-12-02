@@ -1192,9 +1192,12 @@ For each narrative return:
       const content = typeof data === 'string' ? data : JSON.stringify(data, null, 2);
       console.log(`💾 [CRS] Writing ${path}: ${content.length} bytes`);
       
+      // Convert to Blob to ensure proper encoding
+      const blob = new Blob([content], { type: 'application/json' });
+      
       const { error } = await supabase.storage
         .from('horizon-files')
-        .upload(path, content, { 
+        .upload(path, blob, { 
           contentType: 'application/json',
           upsert: true 
         });
