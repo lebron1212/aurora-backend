@@ -851,12 +851,15 @@ app.post('/sync-journals', async (req, res) => {
   try {
     // Load existing journal data from Supabase
     let storedJournals = await horizonCRS.readFile('journals.json') || {};
+    console.log(`📊 [SYNC] Before sync: ${Object.keys(storedJournals).length} dates stored: [${Object.keys(storedJournals).join(', ')}]`);
     
     // Store journals by date
     storedJournals[date] = journals;
+    console.log(`📝 [SYNC] Adding ${date} with ${journals.length} entries (${journals.reduce((sum, j) => sum + (j.content?.length || 0), 0)} chars)`);
     
     // Write back to Supabase
     await horizonCRS.writeFile('journals.json', storedJournals);
+    console.log(`✅ [SYNC] After sync: ${Object.keys(storedJournals).length} dates stored: [${Object.keys(storedJournals).join(', ')}]`);
     
     if (isInitialSync) {
       console.log(`📚 [SYNC] Initial sync: Stored ${journals.length} journals for ${date}`);
