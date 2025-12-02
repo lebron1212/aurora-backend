@@ -269,13 +269,197 @@ class HorizonCRSService {
     }
 
     // Process each type
-    const entities = await this.processEntities(journalText, rawData.existing.entities);
-    const facts = await this.processFacts(journalText, entities, rawData.existing.facts);
-    const loops = await this.processOpenLoops(journalText, entities, rawData.existing.loops);
-    const patterns = await this.processPatterns(journalText, facts, rawData.existing.patterns);
-    const narratives = await this.processNarratives(journalText, entities, facts, rawData.existing.narratives);
+    let entities = await this.processEntities(journalText, rawData.existing.entities);
+    let facts = await this.processFacts(journalText, entities, rawData.existing.facts);
+    let loops = await this.processOpenLoops(journalText, entities, rawData.existing.loops);
+    let patterns = await this.processPatterns(journalText, facts, rawData.existing.patterns);
+    let narratives = await this.processNarratives(journalText, entities, facts, rawData.existing.narratives);
+
+    // ========================================
+    // POST-PROCESSING REFINEMENTS
+    // ========================================
+    
+    // 1. Apply entity decay (reduce salience of entities not mentioned this run)
+    entities = this.applyEntityDecay(entities, rawData.existing.entities);
+    
+    // 2. Reinforce repeated facts (increase confidence)
+    facts = this.reinforceFacts(facts, rawData.existing.facts);
+    
+    // 3. Upgrade patterns (hypothesis → confirmed after 2+ datapoints)
+    patterns = this.upgradePatterns(patterns, facts);
+    
+    // 4. Merge similar open loops
+    loops = this.mergeOpenLoops(loops);
+
+    console.log('✨ [CRS] Post-processing refinements applied');
 
     return { entities, facts, loops, patterns, narratives };
+  }
+
+  // ============================================================================
+  // POST-PROCESSING REFINEMENTS
+  // ============================================================================
+
+  /**
+   * Apply decay to entities not mentioned in this run
+   * Entities lose 0.05 salience per day without mention (min 0.1)
+   */
+  applyEntityDecay(currentEntities, previousEntities) {
+    const now = Date.now();
+    const ONE_DAY = 24 * 60 * 60 * 1000;
+    
+    return currentEntities.map(entity => {
+      // Find if this entity existed before
+      const previous = previousEntities.find(p => p.id === entity.id);
+      
+      if (previous && entity.lastMentionedAt === previous.lastMentionedAt) {
+        // Entity wasn't mentioned this run - apply decay
+        const daysSinceLastMention = Math.floor((now - entity.lastMentionedAt) / ONE_DAY);
+        const decay = daysSinceLastMention * (entity.decayRate || 0.05);
+        const newSalience = Math.max(0.1, (entity.salience || 0.5) - decay);
+        
+        if (newSalience < entity.salience) {
+          console.log(`📉 [DECAY] ${entity.name}: ${entity.salience?.toFixed(2)} → ${newSalience.toFixed(2)}`);
+          return {
+            ...entity,
+            salience: newSalience,
+            lastDecayAt: now
+          };
+        }
+      }
+      
+      return entity;
+    });
+  }
+
+  /**
+   * Reinforce facts that appear in multiple runs
+   * Increases confidence by 0.1 per reinforcement (max 1.0)
+   */
+  reinforceFacts(currentFacts, previousFacts) {
+    return currentFacts.map(fact => {
+      // Check if similar fact existed before
+      const similar = previousFacts.find(p => {
+        const similarity = this.calculateTextSimilarity(p.content, fact.content);
+        return similarity > 0.7 && p.entityId === fact.entityId;
+      });
+      
+      if (similar && similar.id !== fact.id) {
+        // This is a reinforcement of an existing fact
+        const newConfidence = Math.min(1.0, (similar.confidence || 0.7) + 0.1);
+        const newCount = (similar.reinforcementCount || 1) + 1;
+        
+        console.log(`📈 [REINFORCE] "${fact.content.substring(0, 40)}..." confidence: ${newConfidence.toFixed(2)} (×${newCount})`);
+        
+        return {
+          ...similar,
+          content: fact.content, // Use latest wording
+          confidence: newConfidence,
+          reinforcementCount: newCount,
+          lastReinforcedAt: Date.now(),
+          updatedAt: Date.now()
+        };
+      }
+      
+      return fact;
+    });
+  }
+
+  /**
+   * Upgrade patterns from hypothesis to confirmed
+   * After 2+ supporting facts or mentions, status becomes "confirmed"
+   */
+  upgradePatterns(patterns, facts) {
+    return patterns.map(pattern => {
+      if (pattern.status === 'confirmed') return pattern;
+      
+      // Count supporting evidence
+      const patternWords = new Set(pattern.claim.toLowerCase().split(/\s+/).filter(w => w.length > 3));
+      
+      let supportCount = 0;
+      for (const fact of facts) {
+        const factWords = new Set(fact.content.toLowerCase().split(/\s+/).filter(w => w.length > 3));
+        const overlap = [...patternWords].filter(w => factWords.has(w)).length;
+        if (overlap >= 2) supportCount++;
+      }
+      
+      // Also count existing evidence
+      supportCount += (pattern.evidence?.length || 0);
+      
+      if (supportCount >= 2 && pattern.status === 'hypothesis') {
+        console.log(`🎯 [UPGRADE] Pattern "${pattern.claim.substring(0, 40)}..." → CONFIRMED (${supportCount} datapoints)`);
+        return {
+          ...pattern,
+          status: 'confirmed',
+          strength: Math.min(1.0, (pattern.strength || 0.5) + 0.2),
+          confirmedAt: Date.now(),
+          updatedAt: Date.now()
+        };
+      }
+      
+      return pattern;
+    });
+  }
+
+  /**
+   * Merge similar open loops into single loops with combined context
+   */
+  mergeOpenLoops(loops) {
+    const openLoops = loops.filter(l => l.status === 'open');
+    const resolvedLoops = loops.filter(l => l.status === 'resolved');
+    const merged = [];
+    const mergedIds = new Set();
+    
+    for (const loop of openLoops) {
+      if (mergedIds.has(loop.id)) continue;
+      
+      // Find similar loops
+      const similar = openLoops.filter(other => {
+        if (other.id === loop.id || mergedIds.has(other.id)) return false;
+        const similarity = this.calculateTextSimilarity(loop.title, other.title);
+        return similarity > 0.6;
+      });
+      
+      if (similar.length > 0) {
+        // Merge into primary loop
+        const allRelatedEntities = [...new Set([
+          ...(loop.relatedEntityIds || []),
+          ...similar.flatMap(s => s.relatedEntityIds || [])
+        ])];
+        
+        // Use earliest due date
+        const dueDates = [loop.dueDate, ...similar.map(s => s.dueDate)].filter(Boolean);
+        const earliestDue = dueDates.sort()[0] || null;
+        
+        console.log(`🔗 [MERGE] Combining ${similar.length + 1} similar loops: "${loop.title}"`);
+        
+        merged.push({
+          ...loop,
+          relatedEntityIds: allRelatedEntities,
+          dueDate: earliestDue,
+          priority: Math.min(loop.priority || 2, ...similar.map(s => s.priority || 2)),
+          updatedAt: Date.now()
+        });
+        
+        similar.forEach(s => mergedIds.add(s.id));
+      } else {
+        merged.push(loop);
+      }
+      
+      mergedIds.add(loop.id);
+    }
+    
+    return [...merged, ...resolvedLoops];
+  }
+
+  /**
+   * Calculate text similarity (word overlap ratio)
+   */
+  calculateTextSimilarity(text1, text2) {
+    const words1 = new Set(text1.toLowerCase().split(/\s+/).filter(w => w.length > 2));
+    const words2 = new Set(text2.toLowerCase().split(/\s+/).filter(w => w.length > 2));
+    const overlap = [...words1].filter(w => words2.has(w)).length;
+    return overlap / Math.max(words1.size, words2.size);
   }
 
   // ============================================================================
