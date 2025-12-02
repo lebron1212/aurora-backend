@@ -544,6 +544,37 @@ app.get('/system/status', (req, res) => {
   }
 });
 
+// Debug endpoint to check what's actually in journals.json
+app.get('/debug/journals', async (req, res) => {
+  try {
+    console.log('🔍 [DEBUG] Reading journals.json directly...');
+    const journals = await horizonCRS.readFile('journals.json');
+    
+    if (!journals) {
+      return res.json({ error: 'journals.json not found or empty', data: null });
+    }
+    
+    const summary = {
+      totalDates: Object.keys(journals).length,
+      dates: Object.keys(journals).sort(),
+      entriesPerDate: {},
+      sampleContent: {}
+    };
+    
+    for (const [date, entries] of Object.entries(journals)) {
+      summary.entriesPerDate[date] = entries?.length || 0;
+      if (entries && entries[0] && entries[0].content) {
+        summary.sampleContent[date] = entries[0].content.substring(0, 100);
+      }
+    }
+    
+    res.json({ summary, fullData: journals });
+  } catch (error) {
+    console.error('❌ [DEBUG] Failed to read journals:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Write file to system (for web client)
 app.post('/system/write', async (req, res) => {
   try {
