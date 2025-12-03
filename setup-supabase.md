@@ -80,4 +80,4 @@ curl -X POST 'https://YOUR_PROJECT_REF.supabase.co/storage/v1/object/horizon-fil
 After setup is complete:
 1. Update backend-deployment/package.json with @supabase/supabase-js
 2. Create horizon-crs-service.js with Supabase integration
-3. Update task-notification-server.js to use the new service
+3. Update server.js to use the new service

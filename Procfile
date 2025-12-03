@@ -1,1 +1,1 @@
-web: node task-notification-server.js
+web: node server.js

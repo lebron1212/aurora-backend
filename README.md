@@ -15,7 +15,7 @@ This directory contains the backend notification server deployed to Railway.
 - Supports multiple reminder types (once, daily, weekly, monthly)
 
 ## Files
-- `task-notification-server.js` - Main server application
+- `server.js` - Main server application
 - `package.json` - Node.js dependencies and scripts
 - `Procfile` - Railway deployment configuration
 - `railway.json` - Railway build settings

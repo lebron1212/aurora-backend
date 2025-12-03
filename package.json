@@ -2,11 +2,11 @@
   "name": "aurora-notification-server",
   "version": "1.0.1",
   "description": "Aurora task notification and background processing server",
-  "main": "task-notification-server.js",
+  "main": "server.js",
   "type": "module",
   "scripts": {
-    "start": "node task-notification-server.js",
-    "dev": "node task-notification-server.js",
+    "start": "node server.js",
+    "dev": "node server.js",
     "test:gpt4": "node gpt4-test-server.js",
     "build": "echo 'No build needed'"
   },

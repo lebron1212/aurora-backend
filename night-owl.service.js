@@ -320,7 +320,7 @@ class NightOwlService {
    * Process a single loop and generate insight
    */
   async processLoop(loop, userContext) {
-    const strategy = this.determineStrategy(loop);
+    const strategy = await this.determineStrategy(loop);
     
     switch (strategy) {
       case 'research':
@@ -335,35 +335,46 @@ class NightOwlService {
   }
 
   /**
-   * Determine what kind of work this loop needs
+   * Determine what kind of work this loop needs using LLM
    */
-  determineStrategy(loop) {
-    const titleLower = loop.title.toLowerCase();
-    const descLower = (loop.description || '').toLowerCase();
-    const combined = titleLower + ' ' + descLower;
+  async determineStrategy(loop) {
+    // Quick heuristic first for obvious cases
+    if (loop.loopType === 'decision') return 'decision';
+    if (loop.isMilestone) return 'milestone';
+    
+    try {
+      const response = await this.anthropic.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 50,
+        messages: [{
+          role: 'user',
+          content: `Classify this open loop into ONE category:
 
-    // Research needed
-    if (combined.includes('trip') || combined.includes('travel') || 
-        combined.includes('visit') || combined.includes('vacation') ||
-        combined.includes('research') || combined.includes('find out') ||
-        combined.includes('look into') || combined.includes('options for')) {
-      return 'research';
+LOOP: "${loop.title}"
+${loop.description ? `Details: ${loop.description}` : ''}
+Type: ${loop.loopType}
+
+Categories:
+- research: Needs information gathering, exploring options, planning trips/activities
+- decision: Needs to weigh options and make a choice
+- preparation: Needs to prepare for a conversation, meeting, or interaction
+- breakdown: Too vague, needs to be broken into concrete steps
+- general: Just needs a fresh perspective or next step
+
+Reply with ONLY the category name, nothing else.`
+        }],
+        system: 'Classify the loop into exactly one category. Reply with only the category name.'
+      });
+
+      const category = response.content[0]?.text?.trim().toLowerCase();
+      const validCategories = ['research', 'decision', 'preparation', 'breakdown', 'general'];
+      
+      return validCategories.includes(category) ? category : 'general';
+
+    } catch (error) {
+      console.warn('⚠️ [NightOwl] Strategy classification failed, defaulting to general');
+      return 'general';
     }
-
-    // Decision analysis
-    if (loop.loopType === 'decision' || combined.includes('should i') ||
-        combined.includes('decide') || combined.includes('choice') ||
-        combined.includes('whether to')) {
-      return 'decision';
-    }
-
-    // Conversation/approach preparation
-    if (combined.includes('talk to') || combined.includes('conversation with') ||
-        combined.includes('approach') || combined.includes('discuss with')) {
-      return 'preparation';
-    }
-
-    return 'general';
   }
 
   // ============================================================================
@@ -1355,21 +1366,30 @@ Be insightful and help them see the bigger picture of their learning journey.`
     const insights = [];
     
     try {
-      // Get all plans from open loops
       const loops = await this.crsService.loadExistingSystemFiles('open_loops');
-      const plans = loops.filter(l => 
+      
+      // PRIORITIZE MILESTONES FIRST
+      const milestoneLoops = loops.filter(l => 
+        l.status === 'open' && l.isMilestone
+      ).sort((a, b) => (a.daysUntil || 999) - (b.daysUntil || 999));
+      
+      const planLoops = loops.filter(l => 
         l.status === 'open' && 
         l.loopType === 'plan' &&
-        l.priority <= 2 // Only high-priority plans
+        l.priority <= 2 &&
+        !l.isMilestone
       );
 
-      if (plans.length === 0) {
-        console.log('⏭️ [NightOwl] No high-priority plans to iterate on');
-        return insights;
+      // Process milestones first (up to 2)
+      for (const milestone of milestoneLoops.slice(0, 2)) {
+        console.log(`🎯 [NightOwl] Processing MILESTONE: "${milestone.title}"`);
+        const insight = await this.prepareMilestone(milestone, userContext);
+        if (insight) insights.push(insight);
       }
 
-      // Work on up to 2 plans per run
-      for (const plan of plans.slice(0, 2)) {
+      // Then regular plans (up to 2 if room)
+      const remainingSlots = Math.max(0, 2 - milestoneLoops.length);
+      for (const plan of planLoops.slice(0, remainingSlots)) {
         console.log(`🎯 [NightOwl] Analyzing plan: "${plan.title}"`);
         
         // Determine what kind of iteration this plan needs
@@ -1397,7 +1417,7 @@ Be insightful and help them see the bigger picture of their learning journey.`
           insights.push(planInsight);
         }
       }
-
+      
     } catch (error) {
       console.error('❌ [NightOwl] Plan iteration failed:', error.message);
     }
@@ -1405,35 +1425,107 @@ Be insightful and help them see the bigger picture of their learning journey.`
     return insights;
   }
 
-  async determinePlanIterationType(plan, userContext) {
-    const titleLower = plan.title.toLowerCase();
-    const descLower = (plan.description || '').toLowerCase();
-    const combined = titleLower + ' ' + descLower;
+  async prepareMilestone(milestone, userContext) {
+    console.log(`🌟 [NightOwl] Deep prep for milestone: "${milestone.title}"`);
+    
+    // Get related entity context
+    const relatedContext = await this.getRelatedEntitiesContext(milestone.relatedEntityIds || [], userContext);
+    
+    const systemPrompt = `You are helping someone prepare for a highly significant upcoming event/milestone.
 
-    // Check if plan has been stalled
+This is IMPORTANT to them - they've been counting down to it. Your preparation should:
+- Acknowledge the emotional significance
+- Help them mentally/emotionally prepare
+- Surface any practical considerations
+- Offer perspective that might help them be present for it
+- Be warm and supportive, not clinical
+
+This isn't just logistics - it's something meaningful to them.`;
+
+    const userPrompt = `Help prepare for this significant milestone:
+
+MILESTONE: ${milestone.title}
+${milestone.dueDate ? `Date: ${milestone.dueDate}` : ''}
+${milestone.description ? `Context: ${milestone.description}` : ''}
+
+RELATED CONTEXT:
+${relatedContext}
+
+USER PATTERNS:
+${this.buildPatternsContext(userContext)}
+
+Please provide:
+1. Emotional/mental preparation thoughts
+2. Practical considerations they might want to think through
+3. How to be fully present for this moment
+4. Any patterns from their life relevant to this
+
+Be warm and recognize this matters to them.`;
+
+    try {
+      const response = await this.anthropic.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1500,
+        tools: [{ type: 'web_search_20250305' }],
+        messages: [{ role: 'user', content: userPrompt }],
+        system: systemPrompt
+      });
+
+      const { text, sources } = this.extractResponseContent(response);
+
+      return {
+        id: this.generateId('milestone_insight'),
+        loopId: milestone.id,
+        loopTitle: milestone.title,
+        insightType: 'milestone_prep',
+        content: text,
+        conversationHook: `About ${milestone.dueDate || 'the big day'}...`,
+        sources,
+        isMilestone: true,
+        createdAt: Date.now(),
+        status: 'pending'
+      };
+
+    } catch (error) {
+      console.error(`❌ [NightOwl] Milestone prep failed:`, error.message);
+      return null;
+    }
+  }
+
+  async determinePlanIterationType(plan, userContext) {
     const daysSinceUpdate = (Date.now() - (plan.updatedAt || plan.createdAt)) / (24 * 60 * 60 * 1000);
     
-    // If stalled for 5+ days, it might be blocked
-    if (daysSinceUpdate >= 5) {
-      return 'unblock';
-    }
+    // If stalled for 5+ days, likely blocked
+    if (daysSinceUpdate >= 5) return 'unblock';
+    
+    try {
+      const response = await this.anthropic.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 50,
+        messages: [{
+          role: 'user',
+          content: `What does this plan need most?
 
-    // Check if plan needs more research
-    if (combined.includes('research') || combined.includes('figure out') || 
-        combined.includes('find') || combined.includes('how to') ||
-        combined.includes('options') || combined.includes('possibilities')) {
-      return 'research';
-    }
+PLAN: "${plan.title}"
+${plan.description ? `Details: ${plan.description}` : ''}
 
-    // Check if plan is too vague and needs breakdown
-    if (combined.length < 50 || 
-        combined.includes('eventually') || combined.includes('someday') ||
-        combined.includes('figure out how to') || combined.includes('work on')) {
-      return 'breakdown';
-    }
+Options:
+- research: Needs information gathering, exploring options
+- refine: Has direction but needs more concrete steps
+- breakdown: Too vague, needs to be split into tasks
+- general: Just needs fresh perspective
 
-    // Default to refinement
-    return 'refine';
+Reply with ONLY the option name.`
+        }],
+        system: 'Classify what this plan needs. Reply with only one word.'
+      });
+
+      const type = response.content[0]?.text?.trim().toLowerCase();
+      return ['research', 'refine', 'breakdown', 'general'].includes(type) ? type : 'general';
+      
+    } catch {
+      return 'general';
+    }
   }
 
   async researchPlan(plan, userContext) {
