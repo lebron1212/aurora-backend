@@ -8,6 +8,7 @@ import apn from 'apn';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import NightOwlService from './night-owl.service.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -450,6 +451,13 @@ const horizonCRS = new HorizonCRSService();
 await horizonCRS.initialize();
 console.log('🧠 [HORIZON CRS] Service initialized');
 
+// Initialize Night Owl service
+const nightOwl = new NightOwlService(horizonCRS, {
+  anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+  maxLoopsPerRun: 3
+});
+console.log('🦉 [NIGHT OWL] Service initialized');
+
 // Get manual trigger functions
 const { trigger: manualTrigger, status: crsStatus } = horizonCRS.setupManualTrigger();
 
@@ -518,13 +526,18 @@ app.post('/system/process', async (req, res) => {
     }
     
     // Trigger processing in background
-    manualTrigger().catch(error => {
+    manualTrigger().then(async () => {
+      // Run Night Owl after CRS completes
+      console.log('🦉 [NIGHT OWL] Starting post-CRS processing...');
+      const owlResult = await nightOwl.process();
+      console.log(`🦉 [NIGHT OWL] Complete: ${owlResult.insights?.length || 0} insights`);
+    }).catch(error => {
       console.error('❌ [SYSTEM] Background processing failed:', error);
     });
     
     res.json({ 
       success: true, 
-      message: 'CRS processing started',
+      message: 'CRS + Night Owl processing started',
       status 
     });
   } catch (error) {
@@ -623,6 +636,62 @@ app.post('/system/list', async (req, res) => {
   } catch (error) {
     console.error(`❌ [SYSTEM] Failed to list files:`, error);
     res.status(500).json({ error: 'Failed to list files' });
+  }
+});
+
+// ============================================================================
+// NIGHT OWL ENDPOINTS
+// ============================================================================
+
+// Get pending insights for delivery
+app.get('/nightowl/insights', async (req, res) => {
+  try {
+    const insights = await nightOwl.getPendingInsights();
+    res.json({ insights });
+  } catch (error) {
+    console.error('❌ [NIGHT OWL] Failed to get insights:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get next insight to deliver (oldest pending)
+app.get('/nightowl/next', async (req, res) => {
+  try {
+    const insights = await nightOwl.getPendingInsights();
+    res.json({ insight: insights[0] || null });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Mark insight as delivered
+app.post('/nightowl/insights/:id/delivered', async (req, res) => {
+  try {
+    await nightOwl.markInsightDelivered(req.params.id);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Dismiss an insight
+app.post('/nightowl/insights/:id/dismiss', async (req, res) => {
+  try {
+    await nightOwl.dismissInsight(req.params.id);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Manual Night Owl trigger
+app.post('/nightowl/trigger', async (req, res) => {
+  try {
+    console.log('🦉 [NIGHT OWL] Manual trigger...');
+    const result = await nightOwl.process();
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
   }
 });
 
