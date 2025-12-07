@@ -640,6 +640,22 @@ app.post('/system/list', async (req, res) => {
 });
 
 // ============================================================================
+// CRS API ENDPOINTS
+// ============================================================================
+
+// GET /api/crs/suggested-questions - Get AI-generated suggested questions
+app.get('/api/crs/suggested-questions', async (req, res) => {
+  try {
+    console.log('💡 [CRS] Getting suggested questions...');
+    const data = await horizonCRS.readFile('system/suggested_questions.json');
+    res.json(data || { questions: [] });
+  } catch (error) {
+    console.error('Failed to get suggested questions:', error);
+    res.status(500).json({ error: 'Failed to load questions' });
+  }
+});
+
+// ============================================================================
 // NIGHT OWL ENDPOINTS
 // ============================================================================
 

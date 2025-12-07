@@ -8,7 +8,7 @@
  * - Generating update manifests for RTCS sync
  * - Nightly processing cron jobs
  * 
- * Uses OpenAI GPT-4 for intelligent extraction
+ * Uses Claude Sonnet 4 for intelligent extraction
  */
 
 import { createClient } from '@supabase/supabase-js';
@@ -18,14 +18,14 @@ import NightOwlService from './night-owl.service.js';
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const openaiApiKey = process.env.OPENAI_API_KEY;
+const anthropicApiKey = process.env.ANTHROPIC_API_KEY;
 
 if (!supabaseUrl || !supabaseServiceKey) {
   throw new Error('Missing Supabase configuration. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables.');
 }
 
-if (!openaiApiKey) {
-  console.warn('⚠️ [CRS] OPENAI_API_KEY not set. CRS processing will be limited.');
+if (!anthropicApiKey) {
+  console.warn('⚠️ [CRS] ANTHROPIC_API_KEY not set. CRS processing will be limited.');
 }
 
 const supabase = createClient(supabaseUrl, supabaseServiceKey);
@@ -38,44 +38,51 @@ const ENTITY_BLACKLIST = [
 ];
 
 // ============================================================================
-// OPENAI HELPER
+// ANTHROPIC HELPER
 // ============================================================================
 
-async function callOpenAI(systemPrompt, userPrompt, temperature = 0.3) {
-  if (!openaiApiKey) {
-    throw new Error('OpenAI API key not configured');
+async function callClaude(systemPrompt, userPrompt, temperature = 0.3) {
+  if (!anthropicApiKey) {
+    throw new Error('Anthropic API key not configured');
   }
 
-  const response = await fetch('https://api.openai.com/v1/chat/completions', {
+  const response = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
-      'Authorization': `Bearer ${openaiApiKey}`,
+      'x-api-key': anthropicApiKey,
+      'anthropic-version': '2023-06-01',
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
-      model: 'gpt-4o',
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 4096,
+      system: systemPrompt,
       messages: [
-        { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt }
       ],
-      temperature,
-      response_format: { type: 'json_object' }
+      temperature
     }),
   });
 
   if (!response.ok) {
     const error = await response.text();
-    throw new Error(`OpenAI API error: ${response.status} - ${error}`);
+    throw new Error(`Claude API error: ${response.status} - ${error}`);
   }
 
   const data = await response.json();
-  const content = data.choices[0]?.message?.content;
+  const content = data.content?.[0]?.text;
 
   if (!content) {
-    throw new Error('No content in OpenAI response');
+    throw new Error('No content in Claude response');
   }
 
-  return JSON.parse(content);
+  // Extract JSON from response (Claude doesn't have a strict JSON mode)
+  const jsonMatch = content.match(/\{[\s\S]*\}/);
+  if (!jsonMatch) {
+    throw new Error('No JSON found in Claude response');
+  }
+
+  return JSON.parse(jsonMatch[0]);
 }
 
 // ============================================================================
@@ -88,12 +95,13 @@ function generateId(prefix = '') {
   return prefix ? `${prefix}_${timestamp}_${random}` : `${timestamp}_${random}`;
 }
 
-function slugify(text) {
+function slugify(text, maxLength = 40) {
   return text
     .toLowerCase()
     .replace(/[^a-z0-9]+/g, '_')
-    .replace(/^_|_$/g, '')
-    .substring(0, 30);
+    .replace(/^_+|_+$/g, '')
+    .replace(/_+/g, '_')
+    .substring(0, maxLength);
 }
 
 // ============================================================================
@@ -105,7 +113,7 @@ class HorizonCRSService {
     this.isProcessing = false;
     this.lastProcessingTime = null;
     this.fileLocks = new Map();
-    
+
     // Initialize Night Owl service
     this.nightOwl = new NightOwlService(this, {
       anthropicApiKey: process.env.ANTHROPIC_API_KEY,
@@ -244,7 +252,7 @@ class HorizonCRSService {
         questions: suggestedQuestions,
         generatedAt: Date.now()
       });
-      
+
       // 6. Run Night Owl autonomous processing
       console.log('🦉 [CRS] Starting Night Owl processing...');
       try {
@@ -257,10 +265,10 @@ class HorizonCRSService {
         console.error('❌ [CRS] Night Owl processing failed:', nightOwlError.message);
         // Don't fail the whole nightly run if Night Owl fails
       }
-      
+
       const processingTime = Date.now() - startTime;
       this.lastProcessingTime = Date.now();
-      
+
       console.log(`✅ [CRS] Nightly processing completed in ${processingTime}ms`);
       console.log(`📈 [CRS] Processed: ${crsOutputs.entities.length} entities, ${crsOutputs.facts.length} facts, ${crsOutputs.loops.length} loops, ${crsOutputs.patterns.length} patterns, ${crsOutputs.narratives.length} narratives`);
 
@@ -330,10 +338,10 @@ class HorizonCRSService {
    * Process raw data into cognitive representations
    */
   async processCognitiveData(rawData) {
-    console.log('🧠 [CRS] Processing cognitive data with OpenAI...');
+    console.log('🧠 [CRS] Processing cognitive data with Claude...');
 
-    if (!openaiApiKey) {
-      console.warn('⚠️ [CRS] No OpenAI key - returning existing data only');
+    if (!anthropicApiKey) {
+      console.warn('⚠️ [CRS] No Anthropic key - returning existing data only');
       return {
         entities: rawData.existing.entities || [],
         facts: rawData.existing.facts || [],
@@ -372,6 +380,13 @@ class HorizonCRSService {
     let entities = await this.processEntities(journalText, rawData.existing.entities);
     let facts = await this.processFacts(journalText, entities, rawData.existing.facts);
     let loops = await this.processOpenLoops(journalText, entities, rawData.existing.loops);
+
+    // Promote repeated facts to loops
+    const promotedLoops = await this.promoteFactsToLoops(facts, entities, loops);
+    if (promotedLoops.length > 0) {
+      loops = [...loops, ...promotedLoops];
+      console.log(`⬆️ [CRS] Added ${promotedLoops.length} promoted loops`);
+    }
     let patterns = await this.processPatterns(journalText, facts, rawData.existing.patterns);
     let narratives = await this.processNarratives(journalText, entities, facts, rawData.existing.narratives);
 
@@ -394,7 +409,7 @@ class HorizonCRSService {
 
     // 5. Merge similar open loops
     loops = this.mergeOpenLoops(loops);
-    
+
     // 6. Auto-close stale loops
     loops = this.autoCloseStaleLoops(loops);
 
@@ -402,23 +417,23 @@ class HorizonCRSService {
     const milestones = await this.detectMilestones(journalText, entities, loops);
     if (milestones.length > 0) {
       console.log(`🎯 [CRS] Detected ${milestones.length} milestone signals`);
-      
+
       for (const milestone of milestones) {
         console.log(`  → ${milestone.type}: "${milestone.signal}" (intensity: ${milestone.intensity}, entity: ${milestone.entityName || 'unknown'})`);
-        
+
         // Boost entity salience
         if (milestone.entityId) {
           const entity = entities.find(e => e.id === milestone.entityId);
           if (entity) {
             entity.salience = Math.min(1.0, (entity.salience || 0.5) + 0.2);
             entity.hasMilestone = true;
-            entity.milestoneDate = milestone.daysUntil 
+            entity.milestoneDate = milestone.daysUntil
               ? new Date(Date.now() + milestone.daysUntil * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
               : null;
             console.log(`  📈 Boosted ${entity.name} salience to ${entity.salience.toFixed(2)}`);
           }
         }
-        
+
         // Boost loop priority to 1 (highest)
         if (milestone.loopId) {
           const loop = loops.find(l => l.id === milestone.loopId);
@@ -429,7 +444,7 @@ class HorizonCRSService {
             console.log(`  ⬆️ Elevated "${loop.title}" to priority 1 (milestone)`);
           }
         }
-        
+
         // If no loop exists, create one
         if (!milestone.loopId && milestone.entityId && milestone.daysUntil) {
           const newLoop = {
@@ -448,15 +463,15 @@ class HorizonCRSService {
           loops.push(newLoop);
           console.log(`  ✨ Created milestone loop: "${newLoop.title}"`);
         }
-        
+
         // Update narrative trajectory
-        const narrative = narratives.find(n => 
+        const narrative = narratives.find(n =>
           n.characterIds?.includes(milestone.entityId) ||
           n.topic.toLowerCase().includes(milestone.entityName?.toLowerCase() || '')
         );
         if (narrative) {
           narrative.trajectory = 'approaching_milestone';
-          narrative.milestoneDate = milestone.daysUntil 
+          narrative.milestoneDate = milestone.daysUntil
             ? new Date(Date.now() + milestone.daysUntil * 24 * 60 * 60 * 1000).toISOString().split('T')[0]
             : null;
           console.log(`  📖 Updated narrative "${narrative.topic}" → approaching_milestone`);
@@ -543,7 +558,7 @@ class HorizonCRSService {
    * Returns facts with supersession relationships applied
    */
   async resolveFactContradictions(newFacts, existingFacts) {
-    if (!openaiApiKey || newFacts.length === 0) {
+    if (!anthropicApiKey || newFacts.length === 0) {
       return { resolvedNew: newFacts, updatedExisting: existingFacts };
     }
 
@@ -561,7 +576,7 @@ class HorizonCRSService {
 
     for (const newFact of newFacts) {
       const relevantExisting = existingByEntity[newFact.entityId] || [];
-      
+
       if (relevantExisting.length === 0) {
         resolvedNew.push(newFact);
         continue;
@@ -569,11 +584,11 @@ class HorizonCRSService {
 
       // Check for contradictions with LLM
       const contradictions = await this.findContradictions(newFact, relevantExisting);
-      
+
       if (contradictions.length > 0) {
         // Mark new fact as superseding the old ones
         newFact.supersedes = contradictions.map(c => c.oldFactId);
-        
+
         for (const c of contradictions) {
           factsToSupersede.push({
             oldFactId: c.oldFactId,
@@ -583,7 +598,7 @@ class HorizonCRSService {
           console.log(`🔄 [SUPERSEDE] "${c.oldContent}" → "${newFact.content}" (${c.reason})`);
         }
       }
-      
+
       resolvedNew.push(newFact);
     }
 
@@ -612,8 +627,8 @@ class HorizonCRSService {
    */
   async findContradictions(newFact, existingFacts) {
     // Only check facts that could plausibly contradict
-    const candidateFacts = existingFacts.filter(f => 
-      f.isActive !== false && 
+    const candidateFacts = existingFacts.filter(f =>
+      f.isActive !== false &&
       f.category === newFact.category
     );
 
@@ -648,8 +663,8 @@ For each contradiction found, return:
 Return empty array if no contradictions.`;
 
     try {
-      const result = await callOpenAI(systemPrompt, userPrompt, 0.1);
-      
+      const result = await callClaude(systemPrompt, userPrompt, 0.1);
+
       return (result.contradictions || []).map(c => ({
         oldFactId: candidateFacts[c.index]?.id,
         oldContent: candidateFacts[c.index]?.content,
@@ -666,14 +681,14 @@ Return empty array if no contradictions.`;
    * Detect entity updates (role changes, location changes, etc.)
    */
   async resolveEntityUpdates(newEntities, existingEntities) {
-    if (!openaiApiKey) {
+    if (!anthropicApiKey) {
       return { resolved: newEntities, updated: existingEntities };
     }
 
     const updated = [...existingEntities];
 
     for (const newEntity of newEntities) {
-      const existing = updated.find(e => 
+      const existing = updated.find(e =>
         e.name.toLowerCase() === newEntity.name.toLowerCase() ||
         e.aliases?.some(a => a.toLowerCase() === newEntity.name.toLowerCase())
       );
@@ -681,10 +696,10 @@ Return empty array if no contradictions.`;
       if (existing && newEntity.description && existing.description) {
         // Check if description represents an update
         const isUpdate = await this.isEntityUpdate(existing.description, newEntity.description);
-        
+
         if (isUpdate.updated) {
           console.log(`🔄 [ENTITY UPDATE] ${existing.name}: "${existing.description}" → "${newEntity.description}" (${isUpdate.reason})`);
-          
+
           // Archive old description
           existing.previousDescriptions = existing.previousDescriptions || [];
           existing.previousDescriptions.push({
@@ -692,7 +707,7 @@ Return empty array if no contradictions.`;
             archivedAt: Date.now(),
             reason: isUpdate.reason
           });
-          
+
           // Update to new
           existing.description = newEntity.description;
           existing.updatedAt = Date.now();
@@ -712,7 +727,7 @@ ADDITIONAL = both can be true simultaneously (learned new skill, added hobby)
 Return JSON: { "updated": boolean, "reason": "brief explanation" }`;
 
     try {
-      const result = await callOpenAI(systemPrompt, 
+      const result = await callClaude(systemPrompt,
         `OLD: "${oldDesc}"\nNEW: "${newDesc}"`, 0.1);
       return result;
     } catch {
@@ -765,35 +780,35 @@ Return JSON: { "updated": boolean, "reason": "brief explanation" }`;
     const resolvedLoops = loops.filter(l => l.status !== 'open');
     const merged = [];
     const mergedIds = new Set();
-    
+
     for (const loop of openLoops) {
       if (mergedIds.has(loop.id)) continue;
-      
+
       // Find similar loops by title OR by entity+date proximity
       const similar = openLoops.filter(other => {
         if (other.id === loop.id || mergedIds.has(other.id)) return false;
-        
+
         // Check 1: Title similarity (existing logic)
         const titleSimilarity = this.calculateTextSimilarity(loop.title, other.title);
         if (titleSimilarity > 0.5) return true;
-        
+
         // Check 2: Same entity + dates within 3 days
         if (this.loopsShareEntityAndCloseDate(loop, other)) return true;
-        
+
         return false;
       });
-      
+
       if (similar.length > 0) {
         // Merge into primary loop
         const allRelatedEntities = [...new Set([
           ...(loop.relatedEntityIds || []),
           ...similar.flatMap(s => s.relatedEntityIds || [])
         ])];
-        
+
         // Use earliest due date
         const dueDates = [loop.dueDate, ...similar.map(s => s.dueDate)].filter(Boolean);
         const earliestDue = dueDates.sort()[0] || null;
-        
+
         // Combine titles/descriptions for context
         const allTitles = [loop.title, ...similar.map(s => s.title)];
         const combinedDescription = [
@@ -801,9 +816,9 @@ Return JSON: { "updated": boolean, "reason": "brief explanation" }`;
           ...similar.map(s => s.description || ''),
           `(Combined from: ${allTitles.join('; ')})`
         ].filter(Boolean).join('\n');
-        
+
         console.log(`🔗 [MERGE] Combining ${similar.length + 1} related loops: "${loop.title}" + ${similar.map(s => `"${s.title}"`).join(', ')}`);
-        
+
         merged.push({
           ...loop,
           relatedEntityIds: allRelatedEntities,
@@ -812,15 +827,15 @@ Return JSON: { "updated": boolean, "reason": "brief explanation" }`;
           priority: Math.min(loop.priority || 2, ...similar.map(s => s.priority || 2)),
           updatedAt: Date.now()
         });
-        
+
         similar.forEach(s => mergedIds.add(s.id));
       } else {
         merged.push(loop);
       }
-      
+
       mergedIds.add(loop.id);
     }
-    
+
     return [...merged, ...resolvedLoops];
   }
 
@@ -832,22 +847,22 @@ Return JSON: { "updated": boolean, "reason": "brief explanation" }`;
     const entities1 = loop1.relatedEntityIds || [];
     const entities2 = loop2.relatedEntityIds || [];
     const sharedEntities = entities1.filter(e => entities2.includes(e));
-    
+
     if (sharedEntities.length === 0) return false;
-    
+
     // Must both have due dates
     if (!loop1.dueDate || !loop2.dueDate) return false;
-    
+
     // Dates must be within 3 days
     const date1 = new Date(loop1.dueDate).getTime();
     const date2 = new Date(loop2.dueDate).getTime();
     const daysDiff = Math.abs(date1 - date2) / (24 * 60 * 60 * 1000);
-    
+
     if (daysDiff <= 3) {
       console.log(`🔍 [MERGE] Found related loops for ${sharedEntities.join(', ')}: "${loop1.title}" and "${loop2.title}" (${daysDiff.toFixed(1)} days apart)`);
       return true;
     }
-    
+
     return false;
   }
 
@@ -858,13 +873,13 @@ Return JSON: { "updated": boolean, "reason": "brief explanation" }`;
   autoCloseStaleLoops(loops) {
     const now = Date.now();
     const STALE_THRESHOLD_DAYS = 14;
-    
+
     return loops.map(loop => {
       if (loop.status !== 'open') return loop;
-      
+
       const lastActivity = loop.updatedAt || loop.createdAt;
       const daysSinceActivity = (now - lastActivity) / (24 * 60 * 60 * 1000);
-      
+
       // Check if stale
       if (daysSinceActivity >= STALE_THRESHOLD_DAYS) {
         // Check if has future due date (don't auto-close if deadline coming)
@@ -875,7 +890,7 @@ Return JSON: { "updated": boolean, "reason": "brief explanation" }`;
             return loop;
           }
         }
-        
+
         console.log(`🗑️ [STALE] Auto-closing stale loop: "${loop.title}" (${Math.floor(daysSinceActivity)} days inactive)`);
         return {
           ...loop,
@@ -885,7 +900,7 @@ Return JSON: { "updated": boolean, "reason": "brief explanation" }`;
           updatedAt: now
         };
       }
-      
+
       return loop;
     });
   }
@@ -906,22 +921,22 @@ Return JSON: { "updated": boolean, "reason": "brief explanation" }`;
    */
   parseRelativeDate(dateStr) {
     if (!dateStr) return null;
-    
+
     const now = new Date();
     const lowerDate = dateStr.toLowerCase().trim();
-    
+
     // Already ISO format
     if (/^\d{4}-\d{2}-\d{2}/.test(dateStr)) {
       return dateStr;
     }
-    
+
     // "tomorrow"
     if (lowerDate === 'tomorrow') {
       const tomorrow = new Date(now);
       tomorrow.setDate(tomorrow.getDate() + 1);
       return tomorrow.toISOString().split('T')[0];
     }
-    
+
     // "in X days"
     const inDaysMatch = lowerDate.match(/in (\d+) days?/);
     if (inDaysMatch) {
@@ -930,14 +945,14 @@ Return JSON: { "updated": boolean, "reason": "brief explanation" }`;
       future.setDate(future.getDate() + days);
       return future.toISOString().split('T')[0];
     }
-    
+
     // "next week"
     if (lowerDate === 'next week') {
       const nextWeek = new Date(now);
       nextWeek.setDate(nextWeek.getDate() + 7);
       return nextWeek.toISOString().split('T')[0];
     }
-    
+
     // "next [day]" (e.g., "next Tuesday")
     const days = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
     const nextDayMatch = lowerDate.match(/next (\w+)/);
@@ -952,7 +967,7 @@ Return JSON: { "updated": boolean, "reason": "brief explanation" }`;
         return future.toISOString().split('T')[0];
       }
     }
-    
+
     // "[day]" without "next" (e.g., "Tuesday" means this coming Tuesday)
     for (let i = 0; i < days.length; i++) {
       if (lowerDate === days[i]) {
@@ -964,7 +979,7 @@ Return JSON: { "updated": boolean, "reason": "brief explanation" }`;
         return future.toISOString().split('T')[0];
       }
     }
-    
+
     // "Dec 8", "December 8", etc.
     const monthDayMatch = lowerDate.match(/^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w* (\d{1,2})/i);
     if (monthDayMatch) {
@@ -980,7 +995,7 @@ Return JSON: { "updated": boolean, "reason": "brief explanation" }`;
         return future.toISOString().split('T')[0];
       }
     }
-    
+
     // Couldn't parse, return original
     return dateStr;
   }
@@ -989,8 +1004,8 @@ Return JSON: { "updated": boolean, "reason": "brief explanation" }`;
    * Detect milestone signals using LLM semantic understanding
    */
   async detectMilestones(journalText, entities, loops) {
-    if (!openaiApiKey) {
-      console.log('⚠️ [CRS] No OpenAI key - skipping milestone detection');
+    if (!anthropicApiKey) {
+      console.log('⚠️ [CRS] No Anthropic key - skipping milestone detection');
       return [];
     }
 
@@ -1047,16 +1062,16 @@ For each milestone found, return:
 }`;
 
     try {
-      const result = await callOpenAI(systemPrompt, userPrompt, 0.2);
+      const result = await callClaude(systemPrompt, userPrompt, 0.2);
       const milestones = result.milestones || [];
 
       // Enrich with entity/loop IDs
       return milestones.map(m => {
-        const entity = entities.find(e => 
+        const entity = entities.find(e =>
           e.name.toLowerCase() === (m.entityName || '').toLowerCase()
         );
-        
-        const loop = loops.find(l => 
+
+        const loop = loops.find(l =>
           l.title.toLowerCase() === (m.existingLoopTitle || '').toLowerCase() ||
           (m.event && l.title.toLowerCase().includes(m.event.toLowerCase().substring(0, 20)))
         );
@@ -1096,7 +1111,7 @@ ENTITY RULES (v3 Balanced):
 ✅ ALWAYS create an entity for:
 - Proper nouns referring to people (Sarah, Mom, Dr. Lee, Mike)
 - Recurring project/work items (AI Project, Marketing Plan, "the project")
-- Organizations or teams (Our team, OpenAI, Department)
+- Organizations or teams (Our team, Anthropic, Department)
 - Named events that will happen (Architecture Meeting, Tuesday Coffee)
 
 ✅ CREATE if it appears 2+ times:
@@ -1136,7 +1151,7 @@ Return 1-4 entities. For each:
 }`;
 
     try {
-      const result = await callOpenAI(systemPrompt, userPrompt);
+      const result = await callClaude(systemPrompt, userPrompt);
       const newEntities = (result.entities || [])
         // Filter out blacklisted entities
         .filter(e => {
@@ -1190,7 +1205,7 @@ Return 1-4 entities. For each:
       }
 
       // Detect entity updates (role/location changes) before merging
-      const { resolved: resolvedNewEntities, updated: updatedAllEntities } = 
+      const { resolved: resolvedNewEntities, updated: updatedAllEntities } =
         await this.resolveEntityUpdates(newEntities, allEntities);
 
       // Merge new entities (avoid duplicates) and build Self's relationship graph
@@ -1367,7 +1382,7 @@ For each fact return:
 }`;
 
     try {
-      const result = await callOpenAI(systemPrompt, userPrompt);
+      const result = await callClaude(systemPrompt, userPrompt);
       const newFacts = (result.facts || []).map(f => {
         // Find entity ID
         const entity = entities.find(e =>
@@ -1412,13 +1427,13 @@ For each fact return:
       // Merge with existing (deduplication by content)
       const existingContents = new Set(existingFacts.map(f => f.content.toLowerCase()));
       const uniqueNewFacts = newFacts.filter(f => !existingContents.has(f.content.toLowerCase()));
-      
+
       // Detect and resolve contradictions
       const { resolvedNew, updatedExisting } = await this.resolveFactContradictions(
-        uniqueNewFacts, 
+        uniqueNewFacts,
         existingFacts
       );
-      
+
       const allFacts = [...updatedExisting, ...resolvedNew];
 
       console.log(`📝 [CRS] Extracted ${uniqueNewFacts.length} new facts, total: ${allFacts.length}`);
@@ -1434,88 +1449,172 @@ For each fact return:
   // OPEN LOOP EXTRACTION
   // ============================================================================
 
-  async processOpenLoops(journalText, entities, existingLoops) {
-    console.log('🔄 [CRS] Extracting open loops (v3 balanced)...');
+  async processOpenLoops(journalText, entities, facts, existingLoops) {
+    console.log('🔄 [CRS] Processing open loops (fact-first, update-existing)...');
 
     const entityList = entities.map(e => e.name).join(', ');
-    const existingLoopTitles = existingLoops.filter(l => l.status === 'open').map(l => `- ${l.title}`).join('\n');
 
-    const systemPrompt = `You are a cognitive memory system extracting OPEN LOOPS from personal journals.
+    // Format existing open loops for update consideration
+    const openLoops = existingLoops.filter(l => l.status === 'open');
+    const resolvedLoops = existingLoops.filter(l => l.status !== 'open');
 
-An OPEN LOOP is an unresolved item that needs FUTURE attention:
-- Unanswered questions
-- Pending decisions
-- Unfinished tasks
-- Unresolved conflicts
-- Things to follow up on
-- Commitments made for the FUTURE
-- Emotionally significant dreams whose meaning the user is still processing
+    const existingLoopsFormatted = openLoops.map(l => ({
+      id: l.id,
+      title: l.title,
+      loopType: l.loopType,
+      priority: l.priority,
+      dueDate: l.dueDate,
+      relatedEntities: l.relatedEntityIds?.map(eId => entities.find(e => e.id === eId)?.name).filter(Boolean) || [],
+      notes: l.notes || null
+    }));
 
-CRITICAL: PAST vs FUTURE
-🚫 DO NOT create loops for things that ALREADY HAPPENED:
-- "Had coffee with Mike" → PAST, no loop
-- "Met with Sarah yesterday" → PAST, no loop
-- "Went to the gym" → PAST, no loop
-- "The meeting went well" → PAST, no loop
+    // Find facts that might indicate recurring concerns (potential loop promotions)
+    // Look for facts mentioned multiple times or with temporal markers
+    const recentFactContents = facts.slice(-30).map(f => f.content.toLowerCase());
 
-✅ DO create loops for FUTURE items:
-- "Coffee with Mike on Tuesday" → FUTURE, create loop
-- "Need to follow up with Sarah" → FUTURE, create loop
-- "Should go to the gym tomorrow" → FUTURE, create loop
-- "Decide about the job offer by Friday" → FUTURE, create loop
+    const systemPrompt = `You are a cognitive memory system managing OPEN LOOPS from personal journals.
 
-TENSE DETECTION:
-- Past tense verbs (had, met, went, talked, did) = PAST = NO LOOP
-- Future/present intention (will, need to, should, planning to, have to) = FUTURE = CREATE LOOP
-- Scheduled events with future dates = FUTURE = CREATE LOOP
+AN OPEN LOOP is an unresolved item requiring FUTURE action that the user is ACTIVELY TRACKING.
 
-OPEN LOOP RULES (v3 Balanced):
+YOUR PRIMARY JOB: Update existing loops with new information.
+SECONDARY JOB: Identify items that MUST become loops (strict criteria).
+TERTIARY JOB: Mark loops as resolved if journals indicate completion.
 
-✅ CREATE a loop if:
-- A meeting/event is planned for the FUTURE
-- A decision is pending
-- A follow-up is needed
-- A task is implied for the FUTURE
-- A commitment was made that hasn't been fulfilled yet
+═══════════════════════════════════════════════════════════
+STRICT CRITERIA FOR NEW LOOPS (must meet at least one):
+═══════════════════════════════════════════════════════════
 
-🚫 DO NOT create loops for:
-- Events that already happened (past tense)
-- Emotional states alone
-- Vague intentions without action
-- Habits or routines
+✅ IMMEDIATE LOOP - Create right away:
+1. SCHEDULED EVENT: Specific date/time mentioned ("half-marathon in March", "dentist on Tuesday", "flight Dec 15")
+2. EXPLICIT COMMITMENT: Promise made to someone ("told Sarah I'd help her move", "agreed to review his code")
+3. HARD DEADLINE: External deadline with consequences ("taxes due April 15", "application deadline Friday")
 
-QUANTITY RULES:
-- MINIMUM: 1 loop if any FUTURE plan or commitment is mentioned
-- MAXIMUM: 2 loops per processing run
-- If semantically similar to existing loop → skip
+⏳ FACT FIRST - Do NOT create loop yet:
+4. ONE-OFF MENTION: Something noted once without follow-up plan ("check engine light came on", "should call mom", "might try that restaurant")
+5. VAGUE INTENTION: No specific date or commitment ("want to exercise more", "thinking about learning Spanish")
+6. OBSERVATION: Something that happened but has no action ("car made a weird noise", "felt tired today")
 
-Return JSON: { "loops": [...] }`;
+These become loops ONLY if:
+- Mentioned in 2+ separate journal entries (shows it's weighing on them)
+- User explicitly says they need to deal with it
+- It becomes blocking or urgent
 
-    const userPrompt = `Extract 1-2 open loops if any FUTURE plans/commitments exist.
+═══════════════════════════════════════════════════════════
+LOOP LIFECYCLE:
+═══════════════════════════════════════════════════════════
 
-EXISTING OPEN LOOPS (don't duplicate):
-${existingLoopTitles || 'none'}
+NEW → Only if strict criteria met (provide justification)
+UPDATE → New info, date changes, priority shifts, progress notes
+RESOLVE → Journal indicates completion, or user explicitly closed it
+STALE → Will be auto-closed by system if no mention for 14+ days
+
+═══════════════════════════════════════════════════════════
+PRIORITY LEVELS:
+═══════════════════════════════════════════════════════════
+
+1 = URGENT: Deadline within 7 days, or high-stakes commitment
+2 = ACTIVE: Deadline within 30 days, or ongoing tracked item  
+3 = BACKBURNER: No deadline, or 30+ days out
+
+Return JSON: { "updates": [...], "new": [...], "resolve": [...] }`;
+
+    const userPrompt = `Review journals and manage open loops.
+
+EXISTING OPEN LOOPS:
+${existingLoopsFormatted.length > 0
+        ? JSON.stringify(existingLoopsFormatted, null, 2)
+        : 'None yet'}
 
 KNOWN ENTITIES: ${entityList || 'none'}
 
 JOURNALS:
 ${journalText}
 
-If a FUTURE meeting, task, or commitment is mentioned, extract it as a loop.
-Remember: PAST tense = already happened = NO LOOP.
+═══════════════════════════════════════════════════════════
 
-For each loop return:
+For each UPDATE to existing loop:
 {
-  "title": "Concrete action (e.g., 'Coffee meeting with Sarah Tuesday')",
-  "loopType": "task|decision|followup|commitment",
+  "id": "existing loop id",
+  "note": "What's new (1 sentence)",
+  "dueDateUpdate": "new date if changed, or null",
+  "priorityUpdate": 1-3 if changed, or null
+}
+
+For each NEW loop (strict criteria only, max 2):
+{
+  "title": "Concrete item (e.g., 'Half-marathon - March 15')",
+  "loopType": "event|task|decision|commitment",
   "priority": 1-3,
   "relatedEntities": ["entity names"],
-  "dueDate": "if mentioned (e.g., 'tomorrow', 'Dec 8', 'next Tuesday')"
-}`;
+  "dueDate": "specific date if known, or null",
+  "justification": "Which strict criterion does this meet? (scheduled/commitment/deadline)"
+}
+
+For each loop to RESOLVE:
+{
+  "id": "existing loop id",
+  "resolution": "How it was resolved (1 sentence)"
+}
+
+REMEMBER: 
+- One-off mentions → FACT, not loop
+- "Should do X" without date → FACT, not loop  
+- Only scheduled events, commitments, or deadlines → loop`;
 
     try {
-      const result = await callOpenAI(systemPrompt, userPrompt);
-      const newLoops = (result.loops || []).map(l => {
+      const result = await callClaude(systemPrompt, userPrompt, 0.3);
+
+      // Process updates to existing loops
+      let updatedLoops = openLoops.map(existing => {
+        const update = (result.updates || []).find(u => u.id === existing.id);
+
+        if (!update) return existing;
+
+        console.log(`🔄 [CRS] Updating loop "${existing.title}": ${update.note}`);
+
+        // Add note to history
+        const notes = existing.notes || [];
+        notes.push({
+          date: new Date().toISOString().split('T')[0],
+          note: update.note
+        });
+
+        return {
+          ...existing,
+          dueDate: update.dueDateUpdate ? this.parseRelativeDate(update.dueDateUpdate) : existing.dueDate,
+          priority: update.priorityUpdate || existing.priority,
+          notes: notes.slice(-10), // Keep last 10 notes
+          updatedAt: Date.now()
+        };
+      });
+
+      // Process resolutions
+      const resolveIds = new Set((result.resolve || []).map(r => r.id));
+      updatedLoops = updatedLoops.map(loop => {
+        const resolution = (result.resolve || []).find(r => r.id === loop.id);
+        if (resolution) {
+          console.log(`✅ [CRS] Resolving loop "${loop.title}": ${resolution.resolution}`);
+          return {
+            ...loop,
+            status: 'resolved',
+            resolvedAt: Date.now(),
+            resolutionNote: resolution.resolution,
+            updatedAt: Date.now()
+          };
+        }
+        return loop;
+      });
+
+      // Process new loops (should be rare and justified)
+      const newLoops = (result.new || []).map(l => {
+        // Validate justification exists
+        if (!l.justification) {
+          console.warn(`⚠️ [CRS] Rejecting loop "${l.title}" — no justification provided`);
+          return null;
+        }
+
+        console.log(`🔄 [CRS] Creating loop "${l.title}" — ${l.justification}`);
+
         const relatedEntityIds = (l.relatedEntities || [])
           .map(name => entities.find(e => e.name.toLowerCase() === name.toLowerCase())?.id)
           .filter(Boolean);
@@ -1528,34 +1627,232 @@ For each loop return:
           status: 'open',
           relatedEntityIds,
           dueDate: this.parseRelativeDate(l.dueDate) || null,
+          justification: l.justification,
+          notes: [{
+            date: new Date().toISOString().split('T')[0],
+            note: 'Loop created'
+          }],
           createdAt: Date.now(),
-          updatedAt: Date.now(),
-          resolvedAt: null
+          updatedAt: Date.now()
         };
-      });
+      }).filter(Boolean);
 
-      // Better deduplication - check for semantic overlap
-      const uniqueNewLoops = newLoops.filter(newLoop => {
-        const newWords = new Set(newLoop.title.toLowerCase().split(/\s+/).filter(w => w.length > 2));
+      // Combine: updated open loops + newly resolved + still resolved + new
+      const nowResolved = updatedLoops.filter(l => l.status === 'resolved');
+      const stillOpen = updatedLoops.filter(l => l.status === 'open');
+      const allLoops = [...stillOpen, ...newLoops, ...nowResolved, ...resolvedLoops];
 
-        return !existingLoops.some(existing => {
-          if (existing.status === 'resolved') return false;
-          const existingWords = new Set(existing.title.toLowerCase().split(/\s+/).filter(w => w.length > 2));
-          const overlap = [...newWords].filter(w => existingWords.has(w)).length;
-          const similarity = overlap / Math.max(newWords.size, existingWords.size);
-          return similarity > 0.5; // 50% word overlap = duplicate
-        });
-      });
+      const updateCount = (result.updates || []).length;
+      const resolveCount = (result.resolve || []).length;
+      const newCount = newLoops.length;
+      console.log(`🔄 [CRS] Loops: ${updateCount} updated, ${resolveCount} resolved, ${newCount} new, ${allLoops.length} total`);
 
-      const allLoops = [...existingLoops, ...uniqueNewLoops];
-
-      console.log(`🔄 [CRS] Extracted ${uniqueNewLoops.length} new loops, total: ${allLoops.length}`);
       return allLoops;
 
     } catch (error) {
-      console.error('❌ [CRS] Open loop extraction failed:', error.message);
+      console.error('❌ [CRS] Open loop processing failed:', error.message);
       return existingLoops;
     }
+  }
+
+  /**
+   * Scan facts for repeated mentions that should be promoted to loops
+   * "Mentioned twice = becoming a thing the user is tracking"
+   */
+  async promoteFacts ToLoops(facts, entities, existingLoops) {
+    console.log('🔍 [CRS] Scanning for fact → loop promotions...');
+
+    // Get existing loop titles/topics to avoid duplicates
+    const openLoopTitles = existingLoops
+      .filter(l => l.status === 'open')
+      .map(l => l.title.toLowerCase());
+
+    // Group facts by entity + rough topic
+    // Look for facts about the same thing mentioned on different dates
+    const factGroups = this.groupFactsByTopic(facts);
+
+    // Filter to groups with 2+ mentions that aren't already loops
+    const candidates = factGroups.filter(group => {
+      if (group.facts.length < 2) return false;
+
+      // Check if already covered by an existing loop
+      const isAlreadyLoop = openLoopTitles.some(title => {
+        const groupWords = new Set(group.topic.toLowerCase().split(/\s+/));
+        const titleWords = new Set(title.split(/\s+/));
+        const overlap = [...groupWords].filter(w => titleWords.has(w) && w.length > 3).length;
+        return overlap >= 2;
+      });
+
+      if (isAlreadyLoop) return false;
+
+      // Check if mentions span multiple days (not just same-day repetition)
+      const dates = new Set(group.facts.map(f => {
+        const d = new Date(f.createdAt);
+        return d.toISOString().split('T')[0];
+      }));
+
+      return dates.size >= 2; // Mentioned on 2+ different days
+    });
+
+    if (candidates.length === 0) {
+      console.log('🔍 [CRS] No facts ready for promotion');
+      return [];
+    }
+
+    console.log(`🔍 [CRS] Found ${candidates.length} candidate fact clusters for promotion`);
+
+    // Use LLM to decide which candidates should become loops
+    const systemPrompt = `You are evaluating whether REPEATED FACTS should be promoted to OPEN LOOPS.
+
+A fact cluster should become a loop if:
+1. It represents something UNRESOLVED that needs action
+2. The user is clearly TRACKING or THINKING about it (mentioned 2+ times)
+3. It's not just an observation or completed event
+
+Examples:
+✅ PROMOTE: "Check engine light" mentioned 3x over a week → User is worried, needs to deal with it
+✅ PROMOTE: "Mom's birthday" mentioned 2x → Upcoming event user is thinking about
+✅ PROMOTE: "Lease renewal" mentioned 2x → Decision/deadline approaching
+
+🚫 DON'T PROMOTE: "Had coffee with Sarah" 2x → Just recording events, not unresolved
+🚫 DON'T PROMOTE: "Feeling tired" 3x → Observation/pattern, not actionable loop
+🚫 DON'T PROMOTE: "Work was busy" 2x → General state, not a tracked item
+
+Return JSON: { "promote": [...], "skip": [...] }`;
+
+    const candidateSummaries = candidates.map((c, i) => ({
+      index: i,
+      topic: c.topic,
+      mentionCount: c.facts.length,
+      entityName: c.entityName,
+      samples: c.facts.slice(0, 3).map(f => f.content)
+    }));
+
+    const userPrompt = `Evaluate these repeated fact clusters for promotion to open loops:
+
+${JSON.stringify(candidateSummaries, null, 2)}
+
+For each cluster, decide:
+- PROMOTE: User is tracking something unresolved → create a loop
+- SKIP: Just observations, completed events, or patterns → leave as facts
+
+For each PROMOTE:
+{
+  "index": number,
+  "title": "Loop title",
+  "loopType": "task|decision|event|concern",
+  "priority": 2-3,
+  "reason": "Why this deserves to be tracked as a loop"
+}
+
+For each SKIP:
+{
+  "index": number,
+  "reason": "Why this should stay as facts"
+}`;
+
+    try {
+      const result = await callClaude(systemPrompt, userPrompt, 0.2);
+
+      const newLoops = (result.promote || []).map(p => {
+        const candidate = candidates[p.index];
+        if (!candidate) return null;
+
+        console.log(`⬆️ [CRS] Promoting "${candidate.topic}" to loop: ${p.reason}`);
+
+        // Find related entity
+        const entity = entities.find(e =>
+          e.name.toLowerCase() === (candidate.entityName || '').toLowerCase()
+        );
+
+        return {
+          id: generateId('loop'),
+          title: p.title,
+          loopType: p.loopType || 'concern',
+          priority: p.priority || 2,
+          status: 'open',
+          relatedEntityIds: entity ? [entity.id] : [],
+          dueDate: null,
+          promotedFromFacts: candidate.facts.map(f => f.id),
+          promotionReason: p.reason,
+          notes: [{
+            date: new Date().toISOString().split('T')[0],
+            note: `Promoted from ${candidate.facts.length} fact mentions`
+          }],
+          createdAt: Date.now(),
+          updatedAt: Date.now()
+        };
+      }).filter(Boolean);
+
+      // Log skips for debugging
+      for (const skip of (result.skip || [])) {
+        const candidate = candidates[skip.index];
+        if (candidate) {
+          console.log(`➡️ [CRS] Keeping "${candidate.topic}" as facts: ${skip.reason}`);
+        }
+      }
+
+      console.log(`⬆️ [CRS] Promoted ${newLoops.length} fact clusters to loops`);
+      return newLoops;
+
+    } catch (error) {
+      console.error('❌ [CRS] Fact promotion failed:', error.message);
+      return [];
+    }
+  }
+
+  /**
+   * Group facts by entity + semantic topic for promotion analysis
+   */
+  groupFactsByTopic(facts) {
+    const groups = [];
+    const processed = new Set();
+
+    for (const fact of facts) {
+      if (processed.has(fact.id)) continue;
+
+      // Find similar facts (same entity + word overlap)
+      const similar = facts.filter(other => {
+        if (other.id === fact.id || processed.has(other.id)) return false;
+        if (other.entityId !== fact.entityId) return false;
+
+        const similarity = this.calculateTextSimilarity(fact.content, other.content);
+        return similarity > 0.4;
+      });
+
+      if (similar.length > 0) {
+        const allFacts = [fact, ...similar];
+        allFacts.forEach(f => processed.add(f.id));
+
+        // Extract topic from the facts
+        const words = allFacts
+          .flatMap(f => f.content.toLowerCase().split(/\s+/))
+          .filter(w => w.length > 3);
+
+        const wordCounts = {};
+        for (const w of words) {
+          wordCounts[w] = (wordCounts[w] || 0) + 1;
+        }
+
+        const topWords = Object.entries(wordCounts)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 4)
+          .map(([word]) => word);
+
+        const entityName = allFacts[0].entityId === 'self'
+          ? null
+          : allFacts[0].entityId?.replace('entity_', '').replace(/_/g, ' ');
+
+        groups.push({
+          topic: topWords.join(' '),
+          entityId: fact.entityId,
+          entityName,
+          facts: allFacts
+        });
+      }
+    }
+
+    return groups;
   }
 
   // ============================================================================
@@ -1639,7 +1936,7 @@ For each pattern return:
 }`;
 
     try {
-      const result = await callOpenAI(systemPrompt, userPrompt, 0.3);
+      const result = await callClaude(systemPrompt, userPrompt, 0.3);
       const newPatterns = (result.patterns || []).map(p => ({
         id: generateId('pattern'),
         claim: p.claim,
@@ -1681,81 +1978,121 @@ For each pattern return:
   // ============================================================================
 
   async processNarratives(journalText, entities, facts, existingNarratives) {
-    console.log('📖 [CRS] Generating narratives (v3 balanced)...');
+    console.log('📖 [CRS] Processing narratives (update-first)...');
 
     const peopleEntities = entities.filter(e => e.category === 'people' && e.id !== 'self');
     const projectEntities = entities.filter(e => e.category === 'projects');
     const entityNames = [...peopleEntities, ...projectEntities].map(e => e.name).join(', ');
-    const existingNarrativeTopics = existingNarratives.map(n => `- ${n.topic} (${n.type})`).join('\n');
     const factSummary = facts.slice(-10).map(f => f.content).join('; ');
 
-    const systemPrompt = `You are a cognitive memory system generating NARRATIVE ARCS from personal journals.
+    // Format existing narratives for the prompt
+    const existingNarrativesFormatted = existingNarratives.map(n => ({
+      id: n.id,
+      topic: n.topic,
+      type: n.type,
+      summary: n.summary,
+      trajectory: n.trajectory,
+      currentChallenge: n.currentChallenge,
+      characters: n.characterIds?.map(cId => entities.find(e => e.id === cId)?.name).filter(Boolean) || []
+    }));
 
-A NARRATIVE is a story arc that tracks development over time:
-- Relationship arcs (how a relationship is evolving)
-- Project/goal arcs (progress toward something)
-- Personal growth arcs (self-development journeys)
-- Challenge arcs (dealing with difficulties)
+    const systemPrompt = `You are a cognitive memory system maintaining LONG-TERM NARRATIVE ARCS from personal journals.
 
-Emotionally intense dreams that change how the user FEELS about a person or situation
-should be treated as KEY MOMENTS in the relevant relationship or growth narrative,
-not ignored as noise.
+YOUR PRIMARY JOB IS TO UPDATE EXISTING NARRATIVES.
+Creating new narratives is rare and requires strong justification.
 
-NARRATIVE RULES (v3 Balanced):
+A NARRATIVE is a multi-month or multi-year story arc:
+- Relationship arcs (how a relationship evolves over time)
+- Career/life project arcs (sustained endeavors)
+- Personal growth arcs (ongoing self-development)
+- Challenge arcs (difficulties being worked through over time)
 
-✅ ALWAYS create narratives for:
-- Recurring people (one narrative per person)
-- Active projects (one narrative per project)
-- Ongoing personal arc (confidence, mood, creativity → combine into one)
+WHEN UPDATING AN EXISTING NARRATIVE:
+- Look for new developments, shifts, or progress
+- Update the trajectory if direction has changed (improving/declining/stable/uncertain)
+- Update the summary to reflect current state
+- Update currentChallenge if it has shifted
+- Add to the developments log
 
-✅ ONE narrative per domain:
-- Relationship/Social (combine all people interactions)
-- Work/Project (combine all project-related)
-- Personal Development (combine mood, habits, growth)
+WHEN TO CREATE A NEW NARRATIVE (RARE):
+- A genuinely new multi-month arc has emerged
+- It doesn't fit into any existing narrative
+- It passes the "6-month test" — user will still care in 6 months
+- Maximum 1 new narrative per processing run
 
-✅ NARRATIVE STRUCTURE:
-- Topic: Clear name
-- Trajectory: stable | improving | declining | uncertain
-- Summary: 1-2 compact sentences (like a memory index card)
-- Key challenge (if any)
+DO NOT CREATE NARRATIVES FOR:
+- Tasks, errands, one-off events
+- Things completable in days/weeks
+- Single conversations or decisions
+- Facts or observations
 
-🚫 DO NOT:
-- Create one narrative per fact
-- Write verbose paragraph summaries
-- Make narratives from non-entities
-- Create overlapping narratives (Sarah relationship + Sarah project = just "Collaboration with Sarah")
+Return JSON: { "updates": [...], "new": [...] }`;
 
-QUANTITY RULES:
-- MINIMUM: 1 narrative if any person or project exists
-- MAXIMUM: 3 narratives per processing run
+    const userPrompt = `Review these journals and update existing narratives OR (rarely) create new ones.
 
-Return JSON: { "narratives": [...] }`;
-
-    const userPrompt = `Generate 1-3 compact narrative arcs.
+EXISTING NARRATIVES TO POTENTIALLY UPDATE:
+${existingNarrativesFormatted.length > 0
+        ? JSON.stringify(existingNarrativesFormatted, null, 2)
+        : 'None yet'}
 
 KEY ENTITIES: ${entityNames || 'Self only'}
-
 RECENT FACTS: ${factSummary || 'none'}
-
-EXISTING NARRATIVES (update or merge, don't duplicate):
-${existingNarrativeTopics || 'none yet'}
 
 JOURNALS:
 ${journalText}
 
-For each narrative return:
+For each UPDATE return:
 {
-  "topic": "Clear topic (e.g., 'Collaboration with Sarah', 'Personal Development')",
+  "id": "existing narrative id",
+  "development": "What's new (1 sentence)",
+  "summaryUpdate": "New summary if changed, or null",
+  "trajectoryUpdate": "improving|declining|stable|uncertain, or null if unchanged",
+  "challengeUpdate": "New challenge, or null if unchanged"
+}
+
+For each NEW narrative (rare, max 1) return:
+{
+  "topic": "Clear topic name",
   "type": "relationship|project|growth",
-  "summary": "1-2 sentences MAX",
+  "summary": "1-2 sentences",
   "trajectory": "improving|declining|stable|uncertain",
   "characters": ["entity names"],
-  "currentChallenge": "Main challenge or null"
+  "currentChallenge": "Main challenge or null",
+  "justification": "Why this deserves to be a narrative (must reference multi-month scope)"
 }`;
 
     try {
-      const result = await callOpenAI(systemPrompt, userPrompt, 0.4);
-      const newNarratives = (result.narratives || []).map(n => {
+      const result = await callClaude(systemPrompt, userPrompt, 0.4);
+
+      // Process updates to existing narratives
+      const updatedNarratives = existingNarratives.map(existing => {
+        const update = (result.updates || []).find(u => u.id === existing.id);
+
+        if (!update) return existing;
+
+        console.log(`📖 [CRS] Updating narrative "${existing.topic}": ${update.development}`);
+
+        // Add development to history
+        const developments = existing.developments || [];
+        developments.push({
+          date: new Date().toISOString().split('T')[0],
+          note: update.development
+        });
+
+        return {
+          ...existing,
+          summary: update.summaryUpdate || existing.summary,
+          trajectory: update.trajectoryUpdate || existing.trajectory,
+          currentChallenge: update.challengeUpdate !== undefined ? update.challengeUpdate : existing.currentChallenge,
+          developments: developments.slice(-20), // Keep last 20 developments
+          updatedAt: Date.now()
+        };
+      });
+
+      // Process new narratives (should be rare)
+      const newNarratives = (result.new || []).map(n => {
+        console.log(`📖 [CRS] Creating NEW narrative "${n.topic}" — Justification: ${n.justification}`);
+
         const characterIds = (n.characters || [])
           .map(name => entities.find(e => e.name.toLowerCase() === name.toLowerCase())?.id)
           .filter(Boolean);
@@ -1768,45 +2105,25 @@ For each narrative return:
           trajectory: n.trajectory || 'stable',
           characterIds,
           currentChallenge: n.currentChallenge || null,
+          developments: [{
+            date: new Date().toISOString().split('T')[0],
+            note: 'Narrative created'
+          }],
           createdAt: Date.now(),
           updatedAt: Date.now()
         };
       });
 
-      // Better deduplication - check for semantic overlap on topic
-      const allNarratives = [...existingNarratives];
-      for (const newNarrative of newNarratives) {
-        // Find existing narrative with similar topic (word overlap)
-        const newWords = new Set(newNarrative.topic.toLowerCase().split(/\s+/).filter(w => w.length > 2));
+      const allNarratives = [...updatedNarratives, ...newNarratives];
 
-        const existingIndex = allNarratives.findIndex(existing => {
-          const existingWords = new Set(existing.topic.toLowerCase().split(/\s+/).filter(w => w.length > 2));
-          const overlap = [...newWords].filter(w => existingWords.has(w)).length;
-          const similarity = overlap / Math.max(newWords.size, existingWords.size);
-          return similarity > 0.4 || // 40% word overlap
-            existing.topic.toLowerCase().includes(newNarrative.topic.toLowerCase()) ||
-            newNarrative.topic.toLowerCase().includes(existing.topic.toLowerCase());
-        });
+      const updateCount = (result.updates || []).length;
+      const newCount = newNarratives.length;
+      console.log(`📖 [CRS] Narratives: ${updateCount} updated, ${newCount} new, ${allNarratives.length} total`);
 
-        if (existingIndex >= 0) {
-          // Update existing narrative
-          allNarratives[existingIndex] = {
-            ...allNarratives[existingIndex],
-            summary: newNarrative.summary,
-            trajectory: newNarrative.trajectory,
-            currentChallenge: newNarrative.currentChallenge,
-            updatedAt: Date.now()
-          };
-        } else {
-          allNarratives.push(newNarrative);
-        }
-      }
-
-      console.log(`📖 [CRS] Generated ${newNarratives.length} narratives, total: ${allNarratives.length}`);
       return allNarratives;
 
     } catch (error) {
-      console.error('❌ [CRS] Narrative generation failed:', error.message);
+      console.error('❌ [CRS] Narrative processing failed:', error.message);
       return existingNarratives;
     }
   }
@@ -1821,36 +2138,97 @@ For each narrative return:
     const { entities, facts, loops, patterns, narratives } = crsOutputs;
 
     // Export entities by category
+    const usedEntitySlugs = new Set();
     for (const entity of entities) {
       const category = entity.category || 'concepts';
-      const path = `system/entities/${category}/entity_${entity.id}.json`;
+      let slug = slugify(entity.name);
+
+      if (usedEntitySlugs.has(`${category}/${slug}`)) {
+        slug = `${slug}_${entity.id.slice(-6)}`;
+      }
+      usedEntitySlugs.add(`${category}/${slug}`);
+
+      const path = `system/entities/${category}/${slug}.json`;
       await this.writeFile(path, entity);
     }
 
     // Export facts by entity
+    const usedFactSlugs = new Map(); // per-entity tracking
     for (const fact of facts) {
       const entityId = fact.entityId || 'self';
-      // Ensure facts directory for entity exists
-      const path = `system/facts/${entityId}/fact_${fact.id}.json`;
+
+      // Create a slug from fact content (first few meaningful words)
+      const factWords = fact.content
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, '')
+        .split(/\s+/)
+        .filter(w => w.length > 2)
+        .slice(0, 5)
+        .join('_');
+
+      let slug = factWords || 'fact';
+
+      // Track per-entity to allow same slug under different entities
+      const entitySlugs = usedFactSlugs.get(entityId) || new Set();
+      if (entitySlugs.has(slug)) {
+        slug = `${slug}_${fact.id.slice(-6)}`;
+      }
+      entitySlugs.add(slug);
+      usedFactSlugs.set(entityId, entitySlugs);
+
+      const path = `system/facts/${entityId}/${slug}.json`;
       await this.writeFile(path, fact);
     }
 
     // Export loops
+    const usedLoopSlugs = new Set();
     for (const loop of loops) {
       const dir = loop.status === 'resolved' ? 'resolved/' : '';
-      const path = `system/open_loops/${dir}loop_${loop.id}.json`;
+      let slug = slugify(loop.title);
+
+      if (usedLoopSlugs.has(slug)) {
+        slug = `${slug}_${loop.id.slice(-6)}`;
+      }
+      usedLoopSlugs.add(slug);
+
+      const path = `system/open_loops/${dir}${slug}.json`;
       await this.writeFile(path, loop);
     }
 
     // Export patterns
+    const usedPatternSlugs = new Set();
     for (const pattern of patterns) {
-      const path = `system/patterns/pattern_${pattern.id}.json`;
+      // Create slug from claim
+      const claimWords = pattern.claim
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, '')
+        .split(/\s+/)
+        .filter(w => w.length > 2)
+        .slice(0, 5)
+        .join('_');
+
+      let slug = claimWords || 'pattern';
+
+      if (usedPatternSlugs.has(slug)) {
+        slug = `${slug}_${pattern.id.slice(-6)}`;
+      }
+      usedPatternSlugs.add(slug);
+
+      const path = `system/patterns/${slug}.json`;
       await this.writeFile(path, pattern);
     }
 
     // Export narratives
+    const usedNarrativeSlugs = new Set();
     for (const narrative of narratives) {
-      const path = `system/narratives/narrative_${narrative.id}.json`;
+      let slug = slugify(narrative.topic);
+
+      if (usedNarrativeSlugs.has(slug)) {
+        slug = `${slug}_${narrative.id.slice(-6)}`;
+      }
+      usedNarrativeSlugs.add(slug);
+
+      const path = `system/narratives/${slug}.json`;
       await this.writeFile(path, narrative);
     }
 
@@ -1894,89 +2272,127 @@ For each narrative return:
   // ============================================================================
 
   async generateSuggestedQuestions(crsOutputs) {
-    console.log('💡 [CRS] Generating suggested questions...');
+    console.log('💡 [CRS] Generating suggested questions (journal-anchored)...');
 
-    if (!openaiApiKey) {
-      console.warn('⚠️ [CRS] No OpenAI key - using fallback questions');
+    if (!anthropicApiKey) {
+      console.warn('⚠️ [CRS] No Anthropic key - using fallback questions');
       return this.getFallbackQuestions();
     }
 
     const { entities, facts, loops, patterns, narratives } = crsOutputs;
 
-    // Gather context for the prompt
-    const openLoops = loops.filter(l => l.status === 'open').slice(0, 5);
-    const recentPatterns = patterns.filter(p => p.status === 'confirmed' || p.status === 'hypothesis').slice(0, 3);
-    const activeNarratives = narratives.filter(n => n.trajectory !== 'stable').slice(0, 3);
-    const highSalienceEntities = entities
-      .filter(e => e.id !== 'self' && (e.salience || 0) > 0.5)
-      .slice(0, 5);
-    const recentFacts = facts.slice(-10);
+    // Load RECENT journal entries (last 3 days) - this is the key differentiator
+    const recentJournals = await this.loadRecentJournalText(3);
+    
+    // Get today's date info
+    const today = new Date();
+    const dayOfWeek = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][today.getDay()];
+    const dateStr = today.toISOString().split('T')[0];
 
-    const systemPrompt = `You are generating thoughtful, personalized questions for someone to reflect on based on their life context.
+    // Only include URGENT loops (due within 7 days) or high priority
+    const urgentLoops = loops.filter(l => {
+      if (l.status !== 'open') return false;
+      if (l.priority === 1) return true;
+      if (l.dueDate) {
+        const dueDate = new Date(l.dueDate);
+        const daysUntil = (dueDate.getTime() - today.getTime()) / (24 * 60 * 60 * 1000);
+        return daysUntil <= 7 && daysUntil >= 0;
+      }
+      return false;
+    }).slice(0, 3);
 
-QUESTION RULES:
-- Questions should feel like a friend who knows them well asking something meaningful
-- Focus on what's ACTIVE and UNRESOLVED in their life right now
-- Prioritize open loops, pending decisions, and evolving situations
-- Make questions specific to their actual context (use names, projects, situations)
-- Questions should prompt genuine reflection, not yes/no answers
-- Be warm and curious, not clinical or therapeutic
+    // Get milestone entities only
+    const milestoneEntities = entities.filter(e => e.hasMilestone || e.isMilestone).slice(0, 2);
 
-QUESTION CATEGORIES:
-- open_loop: Questions about unresolved tasks, decisions, or commitments
-- pattern: Questions exploring behavioral patterns they might want to understand
-- relationship: Questions about people in their life
-- reflection: Questions about their emotional state or growth
-- goal: Questions about progress toward what they want
+    const systemPrompt = `You generate SHORT questions a user would ask their personal AI assistant.
+
+CRITICAL RULES:
+1. Questions must be FROM the user TO their AI
+2. 5-12 words MAX
+3. Questions must be ANCHORED to the recent journal content provided
+4. DO NOT ask generic questions - every question should reference something SPECIFIC from the last few days
+
+THE RECENT JOURNALS ARE YOUR PRIMARY SOURCE.
+Look for:
+- Specific people mentioned and what happened with them
+- Emotions expressed and their triggers
+- Decisions being mulled over
+- Events that just happened or are about to happen
+- Anxieties, excitements, or unresolved feelings
+
+QUESTION FORMULA:
+[Specific detail from journal] + [what the AI could help with]
+
+GOOD (anchored to journal content):
+- "What do you think about what Sarah said?" (if Sarah said something specific)
+- "Should I be worried about that work thing?"
+- "Did I make the right call yesterday?"
+- "What's your read on how the dinner went?"
+- "Am I overthinking the Stella situation?"
+
+BAD (generic, could be asked any day):
+- "What's happening with Stella?"
+- "How are my relationships going?"
+- "Any patterns lately?"
+- "What should I focus on?"
+
+Today is ${dayOfWeek}, ${dateStr}.
 
 Return JSON: { "questions": [...] }`;
 
-    const userPrompt = `Generate 5 personalized questions based on this person's current life context.
+    const userPrompt = `Generate 5 questions based on what's ACTUALLY in the recent journals.
 
-OPEN LOOPS (unresolved items):
-${openLoops.map(l => `- ${l.title} (${l.loopType}, priority ${l.priority})`).join('\n') || 'None'}
+═══════════════════════════════════════════════════════════
+RECENT JOURNAL ENTRIES (PRIMARY SOURCE - anchor questions here):
+═══════════════════════════════════════════════════════════
+${recentJournals || 'No recent entries found.'}
 
-PATTERNS NOTICED:
-${recentPatterns.map(p => `- ${p.claim} (${p.status})`).join('\n') || 'None'}
+═══════════════════════════════════════════════════════════
+URGENT/IMMINENT (secondary context):
+═══════════════════════════════════════════════════════════
+${urgentLoops.length > 0 
+  ? urgentLoops.map(l => `- ${l.title}${l.dueDate ? ` (${l.dueDate})` : ''}`).join('\n')
+  : 'Nothing urgent'}
 
-ACTIVE NARRATIVES:
-${activeNarratives.map(n => `- ${n.topic}: ${n.summary} (${n.trajectory})`).join('\n') || 'None'}
+${milestoneEntities.length > 0
+  ? `UPCOMING MILESTONES:\n${milestoneEntities.map(e => `- ${e.name}: ${e.milestoneDate || 'soon'}`).join('\n')}`
+  : ''}
 
-KEY PEOPLE/PROJECTS:
-${highSalienceEntities.map(e => `- ${e.name} (${e.category}): ${e.description || 'no description'}`).join('\n') || 'None'}
+═══════════════════════════════════════════════════════════
 
-RECENT FACTS:
-${recentFacts.map(f => `- ${f.content}`).join('\n') || 'None'}
+Generate 5 questions. Each MUST reference something specific from the journal entries.
 
-Generate 5 questions. For each return:
+For each:
 {
   "id": "unique_id",
-  "text": "The question itself",
-  "context": "Brief note on why this question matters now (1 sentence)",
-  "category": "open_loop|pattern|relationship|reflection|goal",
-  "priority": 0.0-1.0 (higher = more relevant right now),
-  "relatedLoopId": "if related to an open loop, its id, otherwise null"
+  "text": "Short question (5-12 words) referencing specific journal content",
+  "anchor": "The specific thing from the journal this references (1 sentence)",
+  "category": "relationship|decision|emotion|event|progress",
+  "priority": 0.0-1.0
 }
 
-PRIORITIZE:
-1. Open loops with decisions or deadlines
-2. Patterns the user might want to explore
-3. Relationships that are evolving
-4. Recent emotional themes`;
+DISTRIBUTION:
+- 2-3 questions about specific people/interactions from journals
+- 1-2 questions about decisions or emotions expressed
+- 0-1 question about an urgent deadline (if any)
+
+If journals are empty, generate questions about what's urgent/imminent instead.`;
 
     try {
-      const result = await callOpenAI(systemPrompt, userPrompt, 0.7);
+      const result = await callClaude(systemPrompt, userPrompt, 0.9); // High temp for variety
       const questions = (result.questions || []).map(q => ({
-        id: q.id || generateId('question'),
+        id: q.id || generateId('q'),
         text: q.text,
-        context: q.context,
-        category: q.category || 'reflection',
+        anchor: q.anchor, // Store what it's anchored to for debugging
+        category: q.category || 'emotion',
         priority: q.priority || 0.5,
-        relatedLoopId: q.relatedLoopId || null,
-        generatedAt: Date.now()
+        generatedAt: Date.now(),
+        generatedFor: dateStr
       }));
 
-      console.log(`💡 [CRS] Generated ${questions.length} suggested questions`);
+      console.log(`💡 [CRS] Generated ${questions.length} journal-anchored questions`);
+      questions.forEach(q => console.log(`  → "${q.text}" (anchored to: ${q.anchor})`));
+      
       return questions;
 
     } catch (error) {
@@ -1985,31 +2401,90 @@ PRIORITIZE:
     }
   }
 
+  /**
+   * Load recent journal text for question generation
+   * @param days - Number of days to look back
+   */
+  async loadRecentJournalText(days = 3) {
+    try {
+      const journals = await this.readFile('journals.json') || {};
+      const today = new Date();
+      const entries = [];
+
+      for (let i = 0; i < days; i++) {
+        const date = new Date(today);
+        date.setDate(date.getDate() - i);
+        const dateStr = date.toISOString().split('T')[0];
+        
+        const dayEntries = journals[dateStr] || [];
+        for (const entry of dayEntries) {
+          const content = entry.content || entry.text || '';
+          if (content.trim()) {
+            entries.push(`[${dateStr}] ${content}`);
+          }
+        }
+      }
+
+      if (entries.length === 0) {
+        console.log('⚠️ [CRS] No journal entries in last', days, 'days');
+        return null;
+      }
+
+      // Limit to ~2000 chars to keep prompt reasonable
+      const combined = entries.join('\n\n');
+      if (combined.length > 2000) {
+        return combined.substring(0, 2000) + '...';
+      }
+      
+      return combined;
+    } catch (error) {
+      console.error('❌ [CRS] Failed to load recent journals:', error.message);
+      return null;
+    }
+  }
+
   getFallbackQuestions() {
+    const dateStr = new Date().toISOString().split('T')[0];
     return [
       {
         id: 'fallback_1',
-        text: "What's on your mind today?",
-        context: 'Open reflection',
-        category: 'reflection',
-        priority: 0.5,
-        generatedAt: Date.now()
+        text: "What's my biggest priority today?",
+        category: 'practical',
+        priority: 0.7,
+        generatedAt: Date.now(),
+        generatedFor: dateStr
       },
       {
         id: 'fallback_2',
-        text: "What are you working on right now?",
-        context: 'Current focus',
-        category: 'goal',
+        text: "Any patterns you've noticed lately?",
+        category: 'insight',
         priority: 0.5,
-        generatedAt: Date.now()
+        generatedAt: Date.now(),
+        generatedFor: dateStr
       },
       {
         id: 'fallback_3',
-        text: "How are you feeling?",
-        context: 'Emotional check-in',
-        category: 'reflection',
+        text: "What's weighing on me right now?",
+        category: 'emotional',
+        priority: 0.6,
+        generatedAt: Date.now(),
+        generatedFor: dateStr
+      },
+      {
+        id: 'fallback_4',
+        text: "How am I doing on my goals?",
+        category: 'progress',
         priority: 0.5,
-        generatedAt: Date.now()
+        generatedAt: Date.now(),
+        generatedFor: dateStr
+      },
+      {
+        id: 'fallback_5',
+        text: "Anything important coming up?",
+        category: 'practical',
+        priority: 0.6,
+        generatedAt: Date.now(),
+        generatedFor: dateStr
       }
     ];
   }
@@ -2277,7 +2752,7 @@ PRIORITIZE:
       const patterns = await this.loadExistingSystemFiles('patterns');
       const manifest = await this.readFile('system/updates/latest.json');
       const suggestedQuestionsData = await this.readFile('system/suggested_questions.json');
-      
+
       // Load Night Owl insights
       const nightOwlInsights = await this.loadNightOwlInsights();
 
