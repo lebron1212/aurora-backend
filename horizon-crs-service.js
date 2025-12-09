@@ -1659,7 +1659,7 @@ REMEMBER:
    * Scan facts for repeated mentions that should be promoted to loops
    * "Mentioned twice = becoming a thing the user is tracking"
    */
-  async promoteFacts ToLoops(facts, entities, existingLoops) {
+  async promoteFactsToLoops(facts, entities, existingLoops) {
     console.log('🔍 [CRS] Scanning for fact → loop promotions...');
 
     // Get existing loop titles/topics to avoid duplicates

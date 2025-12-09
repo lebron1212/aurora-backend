@@ -86,6 +86,31 @@ import Anthropic from '@anthropic-ai/sdk';
  * @property {Array} patterns
  */
 
+/**
+ * @typedef {Object} NightOwlSettings
+ * @property {boolean} enabled - Master switch
+ * @property {boolean} autonomousProcessing - Process loops, patterns automatically
+ * @property {boolean} processQueuedOnly - Only process user-requested analyses
+ * @property {boolean} notificationsEnabled
+ * @property {'immediate'|'morning'} notificationTiming
+ * @property {number} morningHour - When to send morning notification
+ * @property {number} maxInsightsPerNight
+ * @property {number|null} lastProcessedAt
+ * @property {number|null} pausedUntil
+ */
+
+const DEFAULT_SETTINGS = {
+  enabled: true,
+  autonomousProcessing: true,
+  processQueuedOnly: false,
+  notificationsEnabled: true,
+  notificationTiming: 'morning',
+  morningHour: 6,
+  maxInsightsPerNight: 10,
+  lastProcessedAt: null,
+  pausedUntil: null
+};
+
 // ============================================================================
 // NIGHT OWL SERVICE
 // ============================================================================
@@ -96,14 +121,74 @@ class NightOwlService {
     this.anthropicApiKey = config.anthropicApiKey || process.env.ANTHROPIC_API_KEY;
     this.maxLoopsPerRun = config.maxLoopsPerRun || 3;
     this.minPriority = config.minPriority || 2; // Process priority 1 and 2
-    
+    this.settings = DEFAULT_SETTINGS;
+
     if (!this.anthropicApiKey) {
       console.warn('⚠️ [NightOwl] ANTHROPIC_API_KEY not set. Night Owl will be disabled.');
     }
-    
+
     this.anthropic = this.anthropicApiKey ? new Anthropic({
       apiKey: this.anthropicApiKey
     }) : null;
+  }
+
+  // ============================================================================
+  // SETTINGS MANAGEMENT
+  // ============================================================================
+
+  async initialize() {
+    await this.loadSettings();
+  }
+
+  async loadSettings() {
+    try {
+      const saved = await this.crsService.readFile('system/nightowl/settings.json');
+      this.settings = { ...DEFAULT_SETTINGS, ...saved };
+    } catch {
+      this.settings = DEFAULT_SETTINGS;
+    }
+    return this.settings;
+  }
+
+  async saveSettings(updates) {
+    this.settings = { ...this.settings, ...updates };
+    await this.crsService.writeFile('system/nightowl/settings.json', this.settings);
+    return this.settings;
+  }
+
+  /**
+   * Pause autonomous processing until user queues something
+   */
+  async pauseAutonomous() {
+    await this.saveSettings({
+      autonomousProcessing: false,
+      processQueuedOnly: true,
+      pausedUntil: null
+    });
+    console.log('🦉 [NightOwl] Autonomous processing paused. Will only process queued requests.');
+  }
+
+  /**
+   * Resume autonomous processing
+   */
+  async resumeAutonomous() {
+    await this.saveSettings({
+      autonomousProcessing: true,
+      processQueuedOnly: false,
+      pausedUntil: null
+    });
+    console.log('🦉 [NightOwl] Autonomous processing resumed.');
+  }
+
+  /**
+   * Check if we should run autonomous processors
+   */
+  shouldRunAutonomous() {
+    if (!this.settings.enabled) return false;
+    if (this.settings.processQueuedOnly) return false;
+    if (!this.settings.autonomousProcessing) return false;
+    if (this.settings.pausedUntil && Date.now() < this.settings.pausedUntil) return false;
+    return true;
   }
 
   // ============================================================================
@@ -111,105 +196,588 @@ class NightOwlService {
   // ============================================================================
 
   /**
-   * Run Night Owl processing - full suite
-   * Call this after CRS nightly processing completes
+   * Main entry point - called by backend at 2 AM
    */
-  async process() {
-    if (!this.anthropic) {
-      console.log('🦉 [NightOwl] Skipping - no API key configured');
-      return { insights: [], processed: 0 };
+  async processAll() {
+    await this.initialize();
+    
+    if (!this.settings.enabled) {
+      console.log('🦉 [NightOwl] Disabled. Skipping.');
+      return { success: true, insightCount: 0, skipped: true, reason: 'disabled' };
     }
 
-    console.log('🦉 [NightOwl] Starting autonomous processing...');
+    if (!this.anthropic) {
+      console.log('🦉 [NightOwl] Skipping - no API key configured');
+      return { success: true, insightCount: 0, skipped: true, reason: 'no_api_key' };
+    }
+
+    console.log('🦉 [NightOwl] Starting nightly processing...');
     const startTime = Date.now();
     const allInsights = [];
 
     try {
-      // Load user context once for all processors
+      // Load context once
       const userContext = await this.getUserContext();
-      const healthData = await this.getHealthData(); // HealthKit sync'd data
+      const healthData = await this.getHealthData();
+      const trackingData = await this.getTrackingDataFromStore();
 
       // ============================================================
-      // 1. OPEN LOOP PROCESSING (existing)
+      // PHASE 1: QUEUED REQUESTS (always process these)
       // ============================================================
-      const loopInsights = await this.processOpenLoops(userContext);
-      allInsights.push(...loopInsights);
+      const queuedInsights = await this.processQueuedRequests(userContext, healthData, trackingData);
+      allInsights.push(...queuedInsights);
+      
+      // If user queued something, resume autonomous for next time
+      if (queuedInsights.length > 0 && this.settings.processQueuedOnly) {
+        console.log('🦉 [NightOwl] User queued requests - will resume autonomous next run');
+        await this.saveSettings({ processQueuedOnly: false, autonomousProcessing: true });
+      }
 
       // ============================================================
-      // 2. ANTICIPATORY PREP (calendar, birthdays, trips)
+      // PHASE 2: AUTONOMOUS PROCESSING (if enabled)
       // ============================================================
-      const prepInsights = await this.processAnticipatoryPrep(userContext);
-      allInsights.push(...prepInsights);
+      if (this.shouldRunAutonomous()) {
+        console.log('🦉 [NightOwl] Running autonomous processors...');
+        
+        const remaining = this.settings.maxInsightsPerNight - allInsights.length;
+        if (remaining > 0) {
+          const autonomous = await this.runAutonomousProcessors(userContext, healthData, trackingData, remaining);
+          allInsights.push(...autonomous);
+        }
+      } else {
+        console.log('🦉 [NightOwl] Autonomous processing disabled/paused. Skipping.');
+      }
 
       // ============================================================
-      // 3. PATTERN SURFACING
+      // PHASE 3: SAVE & NOTIFY
       // ============================================================
-      const patternInsights = await this.surfacePatterns(userContext, healthData);
-      allInsights.push(...patternInsights);
-
-      // ============================================================
-      // 4. SMART REMINDERS
-      // ============================================================
-      const reminderInsights = await this.generateSmartReminders(userContext);
-      allInsights.push(...reminderInsights);
-
-      // ============================================================
-      // 5. ACCOUNTABILITY CHECK
-      // ============================================================
-      const accountabilityInsights = await this.checkAccountability(userContext);
-      allInsights.push(...accountabilityInsights);
-
-      // ============================================================
-      // 6. CONNECTION FINDING
-      // ============================================================
-      const connectionInsights = await this.findConnections(userContext);
-      allInsights.push(...connectionInsights);
-
-      // ============================================================
-      // 7. HEALTH CORRELATIONS
-      // ============================================================
-      const healthInsights = await this.analyzeHealthCorrelations(userContext, healthData);
-      allInsights.push(...healthInsights);
-
-      // ============================================================
-      // 8. LEARNING SYNTHESIS (if learning content exists)
-      // ============================================================
-      const learningInsights = await this.synthesizeLearning(userContext);
-      allInsights.push(...learningInsights);
-
-      // ============================================================
-      // 9. PLAN ITERATION (research, refine, unblock)
-      // ============================================================
-      const planInsights = await this.iterateOnPlans(userContext);
-      allInsights.push(...planInsights);
-
+      
+      // Dedupe by loopId (don't analyze same thing twice)
+      const deduped = this.dedupeInsights(allInsights);
+      
       // Save all insights
-      for (const insight of allInsights) {
+      for (const insight of deduped) {
         await this.saveInsight(insight);
       }
 
-      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-      console.log(`🦉 [NightOwl] Completed in ${elapsed}s. Generated ${allInsights.length} insights.`);
+      // Update last processed
+      await this.saveSettings({ lastProcessedAt: Date.now() });
 
-      return { 
-        insights: allInsights, 
-        processed: allInsights.length,
+      // Queue notification if insights generated
+      if (deduped.length > 0 && this.settings.notificationsEnabled) {
+        await this.queueNotification(deduped);
+      }
+
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      console.log(`🦉 [NightOwl] Complete in ${elapsed}s. ${deduped.length} insights generated.`);
+
+      return {
+        success: true,
+        insightCount: deduped.length,
         breakdown: {
-          loops: loopInsights.length,
-          prep: prepInsights.length,
-          patterns: patternInsights.length,
-          reminders: reminderInsights.length,
-          accountability: accountabilityInsights.length,
-          connections: connectionInsights.length,
-          health: healthInsights.length,
-          learning: learningInsights.length,
-          plans: planInsights.length
-        }
+          queued: queuedInsights.length,
+          autonomous: deduped.length - queuedInsights.length
+        },
+        elapsed: parseFloat(elapsed)
       };
 
     } catch (error) {
       console.error('❌ [NightOwl] Processing failed:', error);
-      return { insights: allInsights, processed: allInsights.length, error: error.message };
+      return { success: false, error: error.message, insightCount: allInsights.length };
+    }
+  }
+
+  /**
+   * Legacy method - calls processAll for backwards compatibility
+   */
+  async process() {
+    return this.processAll();
+  }
+
+  // ============================================================================
+  // QUEUED REQUEST PROCESSING
+  // ============================================================================
+
+  /**
+   * Process user-queued requests from UnifiedTrackingStore
+   */
+  async processQueuedRequests(userContext, healthData, trackingData) {
+    const insights = [];
+    
+    try {
+      // Read queued requests
+      const queueFile = await this.crsService.readFile('system/nightowl/queue.json').catch(() => null);
+      const queue = queueFile?.requests?.filter(r => r.status === 'pending') || [];
+      
+      if (queue.length === 0) {
+        console.log('🦉 [NightOwl] No queued requests.');
+        return insights;
+      }
+
+      console.log(`🦉 [NightOwl] Processing ${queue.length} queued requests...`);
+
+      // Sort by priority
+      const sorted = queue.sort((a, b) => {
+        const priorityOrder = { high: 0, normal: 1, low: 2 };
+        return priorityOrder[a.priority] - priorityOrder[b.priority];
+      });
+
+      for (const request of sorted) {
+        try {
+          console.log(`🦉 [NightOwl] Processing queued: "${request.request}" (${request.type})`);
+          
+          const insight = await this.processQueuedRequest(request, userContext, healthData, trackingData);
+          
+          if (insight) {
+            insights.push(insight);
+            
+            // Mark request as completed
+            request.status = 'completed';
+            request.result = insight.content;
+            request.completedAt = Date.now();
+          } else {
+            request.status = 'failed';
+            request.error = 'No insight generated';
+          }
+        } catch (error) {
+          console.error(`❌ [NightOwl] Failed to process queued request:`, error.message);
+          request.status = 'failed';
+          request.error = error.message;
+        }
+      }
+
+      // Save updated queue
+      await this.crsService.writeFile('system/nightowl/queue.json', { 
+        requests: queueFile?.requests || queue,
+        lastProcessed: Date.now()
+      });
+
+    } catch (error) {
+      console.error('❌ [NightOwl] Queue processing failed:', error.message);
+    }
+
+    return insights;
+  }
+
+  /**
+   * Process a single queued request
+   */
+  async processQueuedRequest(request, userContext, healthData, trackingData) {
+    
+    // Build data context based on requested sources
+    const dataContext = this.buildDataContext(request.dataSources || ['all'], {
+      userContext,
+      healthData,
+      trackingData
+    });
+
+    const systemPrompt = `You are Night Owl, an AI assistant that works overnight to analyze patterns and provide insights.
+
+The user specifically asked you to: "${request.request}"
+
+Provide a thoughtful, personalized analysis based on the data provided. Be:
+- Insightful and specific (not generic)
+- Connected to their actual life and patterns
+- Actionable where appropriate
+- Warm and supportive
+
+This will be delivered in conversation, so write conversationally.`;
+
+    const userPrompt = `Analyze this for the user:
+
+REQUEST: ${request.request}
+TYPE: ${request.type}
+${request.context ? `ADDITIONAL CONTEXT: ${request.context}` : ''}
+${request.dateRange ? `DATE RANGE: ${request.dateRange.start} to ${request.dateRange.end}` : ''}
+
+DATA AVAILABLE:
+${dataContext}
+
+Please provide your analysis.`;
+
+    try {
+      const response = await this.anthropic.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 2000,
+        tools: request.type === 'research' ? [{ type: 'web_search_20250305' }] : [],
+        messages: [{ role: 'user', content: userPrompt }],
+        system: systemPrompt
+      });
+
+      const { text, sources } = this.extractResponseContent(response);
+
+      return {
+        id: this.generateId('queued_insight'),
+        loopId: request.id,
+        loopTitle: request.request,
+        insightType: `queued_${request.type}`,
+        content: text,
+        conversationHook: this.generateQueuedHook(request),
+        sources,
+        isQueued: true,
+        originalRequest: request,
+        createdAt: Date.now(),
+        status: 'pending'
+      };
+
+    } catch (error) {
+      console.error(`❌ [NightOwl] Queued request analysis failed:`, error.message);
+      return null;
+    }
+  }
+
+  /**
+   * Build data context string based on requested sources
+   */
+  buildDataContext(sources, data) {
+    const { userContext, healthData, trackingData } = data;
+    const parts = [];
+    const includeAll = sources.includes('all');
+
+    // User context / facts
+    if (includeAll || sources.includes('facts') || sources.includes('context')) {
+      if (userContext.relevantFacts?.length > 0) {
+        parts.push('## Personal Context');
+        parts.push(userContext.relevantFacts.slice(0, 15).map(f => `- ${f.content}`).join('\n'));
+      }
+      if (userContext.patterns?.length > 0) {
+        parts.push('\n## Known Patterns');
+        parts.push(userContext.patterns.map(p => `- ${p.claim}`).join('\n'));
+      }
+    }
+
+    // Tracking data (metrics, habits)
+    if (includeAll || sources.includes('tracking') || sources.includes('metrics') || sources.includes('habits')) {
+      if (trackingData.available) {
+        const { metrics, habits, activities } = trackingData;
+        
+        if (Object.keys(metrics).length > 0) {
+          parts.push('\n## Tracked Metrics (30 days)');
+          for (const [name, values] of Object.entries(metrics)) {
+            const recent = values.slice(-14);
+            const avg = recent.reduce((sum, v) => sum + v.value, 0) / recent.length;
+            parts.push(`${name}: avg ${avg.toFixed(1)}, recent: ${recent.slice(-7).map(v => v.value).join(', ')}`);
+          }
+        }
+        
+        if (Object.keys(habits).length > 0) {
+          parts.push('\n## Habit Tracking (30 days)');
+          for (const [name, values] of Object.entries(habits)) {
+            const recent = values.slice(-30);
+            const completed = recent.filter(v => v.completed).length;
+            parts.push(`${name}: ${completed}/${recent.length} days (${Math.round(completed/recent.length*100)}%)`);
+          }
+        }
+
+        if (activities.length > 0) {
+          parts.push('\n## Recent Activities');
+          parts.push(activities.slice(-10).map(a => `- ${a.date}: ${a.name}`).join('\n'));
+        }
+      }
+    }
+
+    // Health data
+    if (includeAll || sources.includes('health')) {
+      if (healthData.available) {
+        if (healthData.sleep?.length > 0) {
+          parts.push('\n## Sleep Data (7 days)');
+          parts.push(healthData.sleep.slice(-7).map(s => 
+            `${s.date}: ${s.duration}hrs, quality: ${s.quality || 'unknown'}`
+          ).join('\n'));
+        }
+        if (healthData.steps?.length > 0) {
+          parts.push('\n## Steps (7 days)');
+          parts.push(healthData.steps.slice(-7).map(s => `${s.date}: ${s.count}`).join(', '));
+        }
+      }
+    }
+
+    // Journals
+    if (includeAll || sources.includes('journals')) {
+      // Would need to load journal entries - placeholder
+      parts.push('\n## Journal Context');
+      parts.push('(Journal entries would be loaded here)');
+    }
+
+    return parts.join('\n') || 'No data available for requested sources.';
+  }
+
+  generateQueuedHook(request) {
+    const hooks = {
+      analyze: `I finished that analysis you asked about — ${request.request.substring(0, 30)}...`,
+      find_pattern: `I looked into patterns around ${request.request.substring(0, 30)}...`,
+      question: `I researched that question — ${request.request.substring(0, 30)}...`,
+      compare: `I compared what you asked about...`,
+      focus: `I did a deep dive on ${request.request.substring(0, 30)}...`,
+      research: `I researched ${request.request.substring(0, 30)}...`
+    };
+    return hooks[request.type] || `About that thing you asked me to look into...`;
+  }
+
+  // ============================================================================
+  // QUEUE MANAGEMENT
+  // ============================================================================
+
+  /**
+   * Queue a request for overnight processing
+   * Called by Claude tool
+   */
+  async queueRequest(request) {
+    const fullRequest = {
+      ...request,
+      id: this.generateId('req'),
+      status: 'pending',
+      createdAt: Date.now(),
+      delivered: false
+    };
+
+    // Load existing queue
+    let queueFile;
+    try {
+      queueFile = await this.crsService.readFile('system/nightowl/queue.json');
+    } catch {
+      queueFile = { requests: [] };
+    }
+
+    queueFile.requests.push(fullRequest);
+    await this.crsService.writeFile('system/nightowl/queue.json', queueFile);
+
+    // If autonomous was paused, note that it should resume
+    if (this.settings.processQueuedOnly) {
+      console.log('🦉 [NightOwl] Request queued. Autonomous processing will resume next run.');
+    }
+
+    return fullRequest;
+  }
+
+  /**
+   * Get queue status
+   */
+  async getQueueStatus() {
+    const queueFile = await this.crsService.readFile('system/nightowl/queue.json').catch(() => ({ requests: [] }));
+    const pending = queueFile.requests?.filter(r => r.status === 'pending') || [];
+    const completed = queueFile.requests?.filter(r => r.status === 'completed') || [];
+    
+    const undelivered = await this.getPendingInsights();
+    
+    return {
+      pending,
+      completed: completed.slice(-10),  // Last 10 completed
+      undelivered,
+      settings: this.settings
+    };
+  }
+
+  // ============================================================================
+  // AUTONOMOUS PROCESSORS
+  // ============================================================================
+
+  /**
+   * Run all autonomous processors
+   */
+  async runAutonomousProcessors(userContext, healthData, trackingData, maxInsights) {
+    const insights = [];
+
+    // Run processors in priority order, stopping when we hit max
+    const processors = [
+      { name: 'milestones', fn: () => this.processMilestones(userContext) },
+      { name: 'openLoops', fn: () => this.processOpenLoops(userContext) },
+      { name: 'anticipatory', fn: () => this.processAnticipatoryPrep(userContext) },
+      { name: 'patterns', fn: () => this.surfacePatterns(userContext, healthData, trackingData) },
+      { name: 'health', fn: () => this.analyzeHealthCorrelations(userContext, healthData, trackingData) },
+      { name: 'accountability', fn: () => this.checkAccountability(userContext) },
+      { name: 'reminders', fn: () => this.generateSmartReminders(userContext) },
+      { name: 'connections', fn: () => this.findConnections(userContext) },
+      { name: 'plans', fn: () => this.iterateOnPlans(userContext) },
+      { name: 'learning', fn: () => this.synthesizeLearning(userContext) }
+    ];
+
+    for (const processor of processors) {
+      if (insights.length >= maxInsights) break;
+      
+      try {
+        const result = await processor.fn();
+        const toAdd = result.slice(0, maxInsights - insights.length);
+        insights.push(...toAdd);
+        
+        if (toAdd.length > 0) {
+          console.log(`🦉 [NightOwl] ${processor.name}: ${toAdd.length} insights`);
+        }
+      } catch (error) {
+        console.error(`❌ [NightOwl] ${processor.name} failed:`, error.message);
+      }
+    }
+
+    return insights;
+  }
+
+  /**
+   * Process milestones specifically (high priority)
+   */
+  async processMilestones(userContext) {
+    const loops = await this.crsService.loadExistingSystemFiles('open_loops');
+    const milestones = loops.filter(l => l.status === 'open' && l.isMilestone);
+    
+    const insights = [];
+    for (const milestone of milestones.slice(0, 2)) {
+      const insight = await this.prepareMilestone(milestone, userContext);
+      if (insight) insights.push(insight);
+    }
+    return insights;
+  }
+
+  dedupeInsights(insights) {
+    const seen = new Set();
+    return insights.filter(i => {
+      const key = i.loopId || i.loopTitle;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }
+
+  /**
+   * Get tracking data from UnifiedTrackingStore
+   */
+  async getTrackingDataFromStore() {
+    try {
+      const trackingFile = await this.crsService.readFile('system/tracking/entries.json').catch(() => null);
+      
+      if (!trackingFile?.entries) {
+        return { metrics: {}, habits: {}, activities: [], available: false };
+      }
+
+      const entries = trackingFile.entries;
+      const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000).toISOString().split('T')[0];
+      const recent = entries.filter(e => e.date >= thirtyDaysAgo);
+
+      const metrics = {};
+      const habits = {};
+      const activities = [];
+
+      for (const entry of recent) {
+        if (entry.type === 'metric' && entry.value !== undefined) {
+          if (!metrics[entry.name]) metrics[entry.name] = [];
+          metrics[entry.name].push({ date: entry.date, value: entry.value });
+        } else if (entry.type === 'habit') {
+          if (!habits[entry.name]) habits[entry.name] = [];
+          habits[entry.name].push({ date: entry.date, completed: entry.valueBool });
+        } else if (entry.type === 'activity') {
+          activities.push({ date: entry.date, name: entry.name, data: entry.data });
+        }
+      }
+
+      return { metrics, habits, activities, available: true };
+    } catch (error) {
+      console.warn('⚠️ [NightOwl] Failed to load tracking data:', error.message);
+      return { metrics: {}, habits: {}, activities: [], available: false };
+    }
+  }
+
+  // ============================================================================
+  // NOTIFICATION SYSTEM
+  // ============================================================================
+
+  /**
+   * Queue notification for delivery
+   * Handles immediate vs morning timing
+   */
+  async queueNotification(insights) {
+    const notification = {
+      id: this.generateId('notif'),
+      insightCount: insights.length,
+      insightTypes: [...new Set(insights.map(i => i.insightType))],
+      createdAt: Date.now(),
+      scheduledFor: this.settings.notificationTiming === 'immediate' 
+        ? Date.now() 
+        : this.getNextMorningTime(),
+      sent: false,
+      message: this.generateNotificationMessage(insights)
+    };
+
+    await this.crsService.writeFile(`system/nightowl/notifications/${notification.id}.json`, notification);
+    console.log(`🔔 [NightOwl] Notification queued for ${this.settings.notificationTiming === 'immediate' ? 'now' : 'morning'}`);
+  }
+
+  getNextMorningTime() {
+    const now = new Date();
+    const morning = new Date();
+    morning.setHours(this.settings.morningHour, 0, 0, 0);
+    
+    // If it's already past morning, schedule for tomorrow
+    if (now.getHours() >= this.settings.morningHour) {
+      morning.setDate(morning.getDate() + 1);
+    }
+    
+    return morning.getTime();
+  }
+
+  generateNotificationMessage(insights) {
+    const count = insights.length;
+    const hasMilestone = insights.some(i => i.insightType === 'milestone_prep');
+    const hasQueued = insights.some(i => i.isQueued);
+    
+    let body;
+    
+    if (hasQueued && count === 1) {
+      body = `I finished that analysis you asked about. Ready when you are.`;
+    } else if (hasMilestone) {
+      body = `I've been thinking about something important coming up.`;
+    } else if (count === 1) {
+      const insight = insights[0];
+      const typeMessages = {
+        research: `I did some research on something you're working on.`,
+        pattern: `I noticed a pattern worth mentioning.`,
+        health: `I found something interesting in your health patterns.`,
+        anticipatory: `I prepared some context for tomorrow.`,
+        accountability: `Quick check-in on some commitments.`
+      };
+      body = typeMessages[insight.insightType] || `I have a thought to share when you're ready.`;
+    } else {
+      body = `I worked on ${count} things overnight. Open when you're ready to chat.`;
+    }
+
+    return {
+      title: 'Horizon',
+      body
+    };
+  }
+
+  /**
+   * Get pending notifications ready to send
+   * Called by iOS/backend notification scheduler
+   */
+  async getPendingNotifications() {
+    try {
+      const files = await this.crsService.listFiles('system/nightowl/notifications');
+      const now = Date.now();
+      const pending = [];
+
+      for (const file of files) {
+        if (!file.name.endsWith('.json')) continue;
+        const notif = await this.crsService.readFile(`system/nightowl/notifications/${file.name}`);
+        if (notif && !notif.sent && notif.scheduledFor <= now) {
+          pending.push(notif);
+        }
+      }
+
+      return pending;
+    } catch {
+      return [];
+    }
+  }
+
+  async markNotificationSent(notificationId) {
+    const path = `system/nightowl/notifications/${notificationId}.json`;
+    try {
+      const notif = await this.crsService.readFile(path);
+      if (notif) {
+        notif.sent = true;
+        notif.sentAt = Date.now();
+        await this.crsService.writeFile(path, notif);
+      }
+    } catch (error) {
+      console.error('❌ [NightOwl] Failed to mark notification sent:', error.message);
     }
   }
 
@@ -241,17 +809,17 @@ class NightOwlService {
    */
   async getWorkableLoops() {
     const allLoops = await this.crsService.loadExistingSystemFiles('open_loops');
-    
+
     // Filter to open, high-priority, workable loops
     const workable = allLoops
       .filter(loop => {
         if (loop.status !== 'open') return false;
         if (loop.priority > this.minPriority) return false;
-        
+
         // Focus on types that benefit from research/thinking
         const workableTypes = ['decision', 'plan', 'question', 'task'];
         if (!workableTypes.includes(loop.loopType)) return false;
-        
+
         return true;
       })
       .sort((a, b) => {
@@ -281,7 +849,7 @@ class NightOwlService {
 
       // Get self facts
       const selfFacts = facts.filter(f => f.entityId === 'self');
-      
+
       // Get confirmed patterns
       const confirmedPatterns = patterns.filter(p => p.status === 'confirmed');
 
@@ -321,7 +889,7 @@ class NightOwlService {
    */
   async processLoop(loop, userContext) {
     const strategy = await this.determineStrategy(loop);
-    
+
     switch (strategy) {
       case 'research':
         return await this.doResearch(loop, userContext);
@@ -341,7 +909,7 @@ class NightOwlService {
     // Quick heuristic first for obvious cases
     if (loop.loopType === 'decision') return 'decision';
     if (loop.isMilestone) return 'milestone';
-    
+
     try {
       const response = await this.anthropic.messages.create({
         model: 'claude-sonnet-4-20250514',
@@ -368,7 +936,7 @@ Reply with ONLY the category name, nothing else.`
 
       const category = response.content[0]?.text?.trim().toLowerCase();
       const validCategories = ['research', 'decision', 'preparation', 'breakdown', 'general'];
-      
+
       return validCategories.includes(category) ? category : 'general';
 
     } catch (error) {
@@ -386,7 +954,7 @@ Reply with ONLY the category name, nothing else.`
 
     // Build context about user preferences
     const userPrefs = this.buildUserPreferencesContext(userContext);
-    
+
     // Get related entities for more context
     const relatedContext = await this.getRelatedEntitiesContext(loop.relatedEntityIds || [], userContext);
 
@@ -667,7 +1235,7 @@ Please offer a helpful perspective or suggest a concrete next step they could ta
       ]);
 
       const hasData = sleep || steps || workouts || heartRate || summary;
-      
+
       if (!hasData) {
         console.log('🦉 [NightOwl] No HealthKit data available (sync from iOS required)');
       }
@@ -683,6 +1251,58 @@ Please offer a helpful perspective or suggest a concrete next step they could ta
     } catch (error) {
       console.warn('⚠️ [NightOwl] Failed to load health data:', error.message);
       return { sleep: [], steps: [], workouts: [], heartRate: [], summary: {}, available: false };
+    }
+  }
+
+  /**
+   * Get tracking data from unified tracking store
+   * 
+   * Reads 30 days of tracking data including:
+   * - Metrics (weight, mood, sleep, etc.)
+   * - Habits (meditation, exercise, etc.)
+   * - Activities (workouts, meals, etc.)
+   */
+  async getTrackingData() {
+    try {
+      const trackingFile = await this.crsService.readFile('system/tracking/entries.json').catch(() => null);
+
+      if (!trackingFile || !trackingFile.entries) {
+        console.log('🦉 [NightOwl] No tracking data available');
+        return { metrics: {}, habits: {}, activities: [], available: false };
+      }
+
+      const entries = trackingFile.entries;
+      const thirtyDaysAgo = new Date(Date.now() - 30 * 86400000).toISOString().split('T')[0];
+      const recentEntries = entries.filter(e => e.date >= thirtyDaysAgo);
+
+      // Organize by type
+      const metrics = {};
+      const habits = {};
+      const activities = [];
+
+      for (const entry of recentEntries) {
+        if (entry.type === 'metric' && entry.value !== undefined) {
+          if (!metrics[entry.name]) metrics[entry.name] = [];
+          metrics[entry.name].push({ date: entry.date, value: entry.value });
+        } else if (entry.type === 'habit' && entry.valueBool !== undefined) {
+          if (!habits[entry.name]) habits[entry.name] = [];
+          habits[entry.name].push({ date: entry.date, completed: entry.valueBool });
+        } else if (entry.type === 'activity') {
+          activities.push({
+            date: entry.date,
+            type: entry.category,
+            name: entry.name,
+            data: entry.data
+          });
+        }
+      }
+
+      console.log(`🦉 [NightOwl] Loaded tracking data: ${Object.keys(metrics).length} metrics, ${Object.keys(habits).length} habits, ${activities.length} activities`);
+
+      return { metrics, habits, activities, available: true };
+    } catch (error) {
+      console.warn('⚠️ [NightOwl] Failed to load tracking data:', error.message);
+      return { metrics: {}, habits: {}, activities: [], available: false };
     }
   }
 
@@ -792,7 +1412,7 @@ Please prepare a brief context summary: who this person is, recent context, any 
     const entities = userContext.relevantEntities || [];
     const facts = userContext.relevantFacts || [];
 
-    const birthdayFacts = facts.filter(f => 
+    const birthdayFacts = facts.filter(f =>
       f.content.toLowerCase().includes('birthday') ||
       f.content.toLowerCase().includes('born on')
     );
@@ -860,18 +1480,18 @@ Please suggest 2-3 thoughtful gift ideas or ways to celebrate, based on what we 
   async prepareForTrips(userContext, calendarEvents) {
     // Look for trip-related open loops
     const loops = await this.crsService.loadExistingSystemFiles('open_loops');
-    const tripLoops = loops.filter(l => 
+    const tripLoops = loops.filter(l =>
       l.status === 'open' &&
       (l.title.toLowerCase().includes('trip') ||
-       l.title.toLowerCase().includes('travel') ||
-       l.title.toLowerCase().includes('vacation') ||
-       l.title.toLowerCase().includes('visit'))
+        l.title.toLowerCase().includes('travel') ||
+        l.title.toLowerCase().includes('vacation') ||
+        l.title.toLowerCase().includes('visit'))
     );
 
     if (tripLoops.length === 0) return null;
 
     const trip = tripLoops[0];
-    
+
     // Check if trip is within next 2 weeks (would need actual date parsing)
     console.log(`✈️ [NightOwl] Preparing for trip: "${trip.title}"`);
 
@@ -926,14 +1546,14 @@ Use web search for current, practical information about the destination.`
   // 3. PATTERN SURFACING
   // ============================================================================
 
-  async surfacePatterns(userContext, healthData) {
+  async surfacePatterns(userContext, healthData, trackingData = {}) {
     console.log('🔍 [NightOwl] Surfacing patterns...');
     const insights = [];
 
     const patterns = await this.crsService.loadExistingSystemFiles('patterns');
-    
+
     // Find recently confirmed patterns that haven't been surfaced
-    const recentPatterns = patterns.filter(p => 
+    const recentPatterns = patterns.filter(p =>
       p.status === 'confirmed' &&
       p.updatedAt > Date.now() - 7 * 24 * 60 * 60 * 1000 && // Last 7 days
       !p.surfacedAt // Not yet surfaced
@@ -941,7 +1561,20 @@ Use web search for current, practical information about the destination.`
 
     if (recentPatterns.length > 0) {
       const pattern = recentPatterns[0];
-      
+
+      // Include tracking data context if available
+      let trackingContext = '';
+      if (trackingData.available) {
+        const metricNames = Object.keys(trackingData.metrics || {});
+        const habitNames = Object.keys(trackingData.habits || {});
+        if (metricNames.length > 0 || habitNames.length > 0) {
+          trackingContext = `\n\nUSER'S TRACKED DATA:
+Metrics being tracked: ${metricNames.join(', ') || 'none'}
+Habits being tracked: ${habitNames.join(', ') || 'none'}
+Recent activities: ${(trackingData.activities || []).slice(-5).map(a => a.name).join(', ') || 'none'}`;
+        }
+      }
+
       try {
         const response = await this.anthropic.messages.create({
           model: 'claude-sonnet-4-20250514',
@@ -952,7 +1585,7 @@ Use web search for current, practical information about the destination.`
 
 PATTERN: ${pattern.claim}
 DOMAIN: ${pattern.domain}
-EVIDENCE: ${JSON.stringify(pattern.evidence || [])}
+EVIDENCE: ${JSON.stringify(pattern.evidence || [])}${trackingContext}
 
 Please explain this pattern in a warm, insightful way. What might be driving it? Is it helpful or something to be aware of? What could they do with this insight?`
           }],
@@ -1000,18 +1633,18 @@ Please explain this pattern in a warm, insightful way. What might be driving it?
     // Look for recent events that warrant follow-up
     const recentEventFacts = facts.filter(f => {
       const isRecent = f.createdAt > Date.now() - 2 * 24 * 60 * 60 * 1000; // Last 2 days
-      const isEvent = f.category === 'event' || 
-                      f.content.toLowerCase().includes('interview') ||
-                      f.content.toLowerCase().includes('meeting') ||
-                      f.content.toLowerCase().includes('conversation with') ||
-                      f.content.toLowerCase().includes('talked to');
+      const isEvent = f.category === 'event' ||
+        f.content.toLowerCase().includes('interview') ||
+        f.content.toLowerCase().includes('meeting') ||
+        f.content.toLowerCase().includes('conversation with') ||
+        f.content.toLowerCase().includes('talked to');
       return isRecent && isEvent;
     });
 
     for (const fact of recentEventFacts.slice(0, 1)) { // Max 1 reminder
       // Check if there's already an open loop for follow-up
-      const hasLoop = loops.some(l => 
-        l.status === 'open' && 
+      const hasLoop = loops.some(l =>
+        l.status === 'open' &&
         l.title.toLowerCase().includes('thank') ||
         l.title.toLowerCase().includes('follow up')
       );
@@ -1037,10 +1670,10 @@ If yes, suggest what they should do. If no follow-up is needed, say so briefly.`
         });
 
         const { text } = this.extractResponseContent(response);
-        
+
         // Only create insight if a follow-up is actually suggested
-        if (!text.toLowerCase().includes('no follow-up') && 
-            !text.toLowerCase().includes('not necessary')) {
+        if (!text.toLowerCase().includes('no follow-up') &&
+          !text.toLowerCase().includes('not necessary')) {
           insights.push({
             id: this.generateId('insight'),
             loopId: null,
@@ -1074,7 +1707,7 @@ If yes, suggest what they should do. If no follow-up is needed, say so briefly.`
     const facts = userContext.relevantFacts || [];
 
     // Find commitments with deadlines that are approaching or passed
-    const commitments = loops.filter(l => 
+    const commitments = loops.filter(l =>
       l.status === 'open' &&
       (l.loopType === 'commitment' || l.loopType === 'decision') &&
       l.dueDate
@@ -1112,7 +1745,7 @@ UPCOMING (within 3 days):
 ${upcoming.map(c => `- "${c.title}" (due: ${c.dueDate})`).join('\n') || 'None'}
 
 STALLED (no progress in 7+ days):
-${stalledLoops.map(l => `- "${l.title}" (${Math.floor((now - (l.updatedAt || l.createdAt)) / (24*60*60*1000))} days)`).join('\n') || 'None'}
+${stalledLoops.map(l => `- "${l.title}" (${Math.floor((now - (l.updatedAt || l.createdAt)) / (24 * 60 * 60 * 1000))} days)`).join('\n') || 'None'}
 
 Please provide a gentle, supportive accountability check. Not nagging - just honest and helpful. If everything looks good, say so briefly.`
           }],
@@ -1186,7 +1819,7 @@ Only share if you find something genuinely insightful - not forced connections.`
 
       // Only add if there's a real insight
       if (!text.toLowerCase().includes('no obvious connections') &&
-          !text.toLowerCase().includes('don\'t see any')) {
+        !text.toLowerCase().includes('don\'t see any')) {
         insights.push({
           id: this.generateId('insight'),
           loopId: null,
@@ -1210,22 +1843,52 @@ Only share if you find something genuinely insightful - not forced connections.`
   // 7. HEALTH CORRELATIONS
   // ============================================================================
 
-  async analyzeHealthCorrelations(userContext, healthData) {
+  async analyzeHealthCorrelations(userContext, healthData, trackingData = {}) {
     console.log('❤️ [NightOwl] Analyzing health correlations...');
     const insights = [];
 
-    // Skip if no health data
-    if (!healthData.available) {
-      console.log('⏭️ [NightOwl] Skipping health analysis - no data synced from HealthKit');
+    // Skip if no health data AND no tracking data
+    if (!healthData.available && !trackingData.available) {
+      console.log('⏭️ [NightOwl] Skipping health analysis - no data available');
       return insights;
     }
 
     const facts = userContext.relevantFacts || [];
-    const moodFacts = facts.filter(f => 
-      f.category === 'emotional' || 
+    const moodFacts = facts.filter(f =>
+      f.category === 'emotional' ||
       f.content.toLowerCase().includes('mood') ||
       f.content.toLowerCase().includes('feel')
     );
+
+    // Build tracking data context
+    let trackingContext = '';
+    if (trackingData.available) {
+      const { metrics, habits, activities } = trackingData;
+
+      // Format metrics
+      const metricsStr = Object.entries(metrics || {}).map(([name, values]) => {
+        const recent = values.slice(-7);
+        return `${name}: ${recent.map(v => `${v.date}: ${v.value}`).join(', ')}`;
+      }).join('\n');
+
+      // Format habits
+      const habitsStr = Object.entries(habits || {}).map(([name, values]) => {
+        const recent = values.slice(-7);
+        const completed = recent.filter(v => v.completed).length;
+        return `${name}: ${completed}/${recent.length} days completed`;
+      }).join('\n');
+
+      trackingContext = `
+TRACKED METRICS (last 7 days):
+${metricsStr || 'No metrics tracked'}
+
+TRACKED HABITS (last 7 days):
+${habitsStr || 'No habits tracked'}
+
+RECENT ACTIVITIES:
+${(activities || []).slice(-7).map(a => `- ${a.date}: ${a.name}`).join('\n') || 'No activities logged'}
+`;
+    }
 
     try {
       const response = await this.anthropic.messages.create({
@@ -1233,34 +1896,36 @@ Only share if you find something genuinely insightful - not forced connections.`
         max_tokens: 800,
         messages: [{
           role: 'user',
-          content: `Here's the user's recent health data and emotional patterns:
+          content: `Here's the user's recent health data, tracking data, and emotional patterns:
 
 SLEEP (last 7 days):
-${JSON.stringify(healthData.sleep.slice(-7), null, 2)}
+${JSON.stringify(healthData.sleep?.slice(-7) || [], null, 2)}
 
 STEPS (last 7 days):
-${JSON.stringify(healthData.steps.slice(-7), null, 2)}
+${JSON.stringify(healthData.steps?.slice(-7) || [], null, 2)}
 
 WORKOUTS (last 7 days):
-${JSON.stringify(healthData.workouts.slice(-7), null, 2)}
-
+${JSON.stringify(healthData.workouts?.slice(-7) || [], null, 2)}
+${trackingContext}
 MOOD/EMOTIONAL FACTS:
 ${moodFacts.slice(-10).map(f => `- [${f.createdAt ? new Date(f.createdAt).toLocaleDateString() : 'unknown'}] ${f.content}`).join('\n')}
 
 Look for correlations:
 - Does sleep quality seem to affect mood?
 - Do exercise days correlate with better emotional states?
+- Are there patterns in tracked metrics (mood, weight, etc.)?
+- How do habit completions relate to wellbeing?
 - Any patterns worth noting?
 
 Only share if you find meaningful correlations.`
         }],
-        system: 'You are analyzing health data to find correlations that could help someone understand their wellbeing better. Be insightful but not preachy.'
+        system: 'You are analyzing health and tracking data to find correlations that could help someone understand their wellbeing better. Be insightful but not preachy.'
       });
 
       const { text } = this.extractResponseContent(response);
 
       if (!text.toLowerCase().includes('no clear correlation') &&
-          !text.toLowerCase().includes('not enough data')) {
+        !text.toLowerCase().includes('not enough data')) {
         insights.push({
           id: this.generateId('insight'),
           loopId: null,
@@ -1289,7 +1954,7 @@ Only share if you find meaningful correlations.`
     const insights = [];
 
     const facts = userContext.relevantFacts || [];
-    
+
     // Find learning-related facts
     const learningFacts = facts.filter(f =>
       f.category === 'insight' ||
@@ -1307,8 +1972,8 @@ Only share if you find meaningful correlations.`
 
     // Get goals to connect learning to
     const loops = await this.crsService.loadExistingSystemFiles('open_loops');
-    const goals = loops.filter(l => 
-      l.loopType === 'plan' || 
+    const goals = loops.filter(l =>
+      l.loopType === 'plan' ||
       l.title.toLowerCase().includes('goal') ||
       l.title.toLowerCase().includes('learn')
     );
@@ -1364,17 +2029,17 @@ Be insightful and help them see the bigger picture of their learning journey.`
   async iterateOnPlans(userContext) {
     console.log('🎯 [NightOwl] Iterating on plans...');
     const insights = [];
-    
+
     try {
       const loops = await this.crsService.loadExistingSystemFiles('open_loops');
-      
+
       // PRIORITIZE MILESTONES FIRST
-      const milestoneLoops = loops.filter(l => 
+      const milestoneLoops = loops.filter(l =>
         l.status === 'open' && l.isMilestone
       ).sort((a, b) => (a.daysUntil || 999) - (b.daysUntil || 999));
-      
-      const planLoops = loops.filter(l => 
-        l.status === 'open' && 
+
+      const planLoops = loops.filter(l =>
+        l.status === 'open' &&
         l.loopType === 'plan' &&
         l.priority <= 2 &&
         !l.isMilestone
@@ -1391,10 +2056,10 @@ Be insightful and help them see the bigger picture of their learning journey.`
       const remainingSlots = Math.max(0, 2 - milestoneLoops.length);
       for (const plan of planLoops.slice(0, remainingSlots)) {
         console.log(`🎯 [NightOwl] Analyzing plan: "${plan.title}"`);
-        
+
         // Determine what kind of iteration this plan needs
         const iterationType = await this.determinePlanIterationType(plan, userContext);
-        
+
         let planInsight = null;
         switch (iterationType) {
           case 'research':
@@ -1417,7 +2082,7 @@ Be insightful and help them see the bigger picture of their learning journey.`
           insights.push(planInsight);
         }
       }
-      
+
     } catch (error) {
       console.error('❌ [NightOwl] Plan iteration failed:', error.message);
     }
@@ -1427,10 +2092,10 @@ Be insightful and help them see the bigger picture of their learning journey.`
 
   async prepareMilestone(milestone, userContext) {
     console.log(`🌟 [NightOwl] Deep prep for milestone: "${milestone.title}"`);
-    
+
     // Get related entity context
     const relatedContext = await this.getRelatedEntitiesContext(milestone.relatedEntityIds || [], userContext);
-    
+
     const systemPrompt = `You are helping someone prepare for a highly significant upcoming event/milestone.
 
 This is IMPORTANT to them - they've been counting down to it. Your preparation should:
@@ -1494,10 +2159,10 @@ Be warm and recognize this matters to them.`;
 
   async determinePlanIterationType(plan, userContext) {
     const daysSinceUpdate = (Date.now() - (plan.updatedAt || plan.createdAt)) / (24 * 60 * 60 * 1000);
-    
+
     // If stalled for 5+ days, likely blocked
     if (daysSinceUpdate >= 5) return 'unblock';
-    
+
     try {
       const response = await this.anthropic.messages.create({
         model: 'claude-sonnet-4-20250514',
@@ -1522,7 +2187,7 @@ Reply with ONLY the option name.`
 
       const type = response.content[0]?.text?.trim().toLowerCase();
       return ['research', 'refine', 'breakdown', 'general'].includes(type) ? type : 'general';
-      
+
     } catch {
       return 'general';
     }
@@ -1530,7 +2195,7 @@ Reply with ONLY the option name.`
 
   async researchPlan(plan, userContext) {
     console.log(`🔍 [NightOwl] Researching plan: "${plan.title}"`);
-    
+
     const systemPrompt = `You are a research assistant helping someone develop their plan by gathering information and insights.
 
 Your research should:
@@ -1595,7 +2260,7 @@ Use web search to find current, relevant information.`;
 
   async refinePlan(plan, userContext) {
     console.log(`🎨 [NightOwl] Refining plan: "${plan.title}"`);
-    
+
     const systemPrompt = `You are a strategic advisor helping someone refine and improve their plan.
 
 Your refinement should:
@@ -1658,9 +2323,9 @@ Make the plan more strategic and actionable.`;
 
   async unblockPlan(plan, userContext) {
     console.log(`🔓 [NightOwl] Unblocking plan: "${plan.title}"`);
-    
+
     const daysSinceUpdate = Math.floor((Date.now() - (plan.updatedAt || plan.createdAt)) / (24 * 60 * 60 * 1000));
-    
+
     const systemPrompt = `You are a strategic advisor helping someone identify and overcome what's blocking their progress on a plan.
 
 Your analysis should:
@@ -1722,7 +2387,7 @@ Help them get unstuck and move forward.`;
 
   async breakdownPlan(plan, userContext) {
     console.log(`📋 [NightOwl] Breaking down plan: "${plan.title}"`);
-    
+
     const systemPrompt = `You are a strategic advisor helping someone break down a vague plan into specific, actionable steps.
 
 Your breakdown should:
@@ -1783,7 +2448,7 @@ Transform this from a vague plan into a clear roadmap.`;
 
   async generalPlanAnalysis(plan, userContext) {
     console.log(`🤔 [NightOwl] General analysis of plan: "${plan.title}"`);
-    
+
     const systemPrompt = `You are a thoughtful advisor providing strategic insight on someone's plan.
 
 Your analysis should:
@@ -1944,18 +2609,18 @@ Return ONLY the opener, nothing else.`
   }
 
   async getPersonContext(name, userContext) {
-    const entity = userContext.relevantEntities?.find(e => 
+    const entity = userContext.relevantEntities?.find(e =>
       e.name.toLowerCase() === name.toLowerCase()
     );
     if (!entity) return null;
 
     const facts = userContext.relevantFacts?.filter(f => f.entityId === entity.id) || [];
-    
+
     let context = `${entity.name}`;
     if (entity.relationshipToSelf) context += ` (${entity.relationshipToSelf})`;
     if (entity.description) context += `: ${entity.description}`;
     context += '\n';
-    
+
     if (facts.length > 0) {
       context += 'Facts:\n' + facts.slice(0, 5).map(f => `- ${f.content}`).join('\n');
     }
@@ -1965,11 +2630,11 @@ Return ONLY the opener, nothing else.`
 
   async getLoopsInvolvingPerson(name) {
     const loops = await this.crsService.loadExistingSystemFiles('open_loops');
-    const involving = loops.filter(l => 
+    const involving = loops.filter(l =>
       l.status === 'open' &&
       l.title.toLowerCase().includes(name.toLowerCase())
     );
-    
+
     if (involving.length === 0) return 'None';
     return involving.map(l => `- ${l.title}`).join('\n');
   }
@@ -1990,7 +2655,7 @@ Return ONLY the opener, nothing else.`
       ?.filter(f => f.confidence > 0.7)
       ?.slice(0, 10)
       ?.map(f => `- ${f.content}`);
-    
+
     if (importantFacts?.length > 0) {
       parts.push(...importantFacts);
     }
@@ -2019,7 +2684,7 @@ Return ONLY the opener, nothing else.`
         return desc;
       });
 
-    return relatedEntities?.length > 0 
+    return relatedEntities?.length > 0
       ? `Related people/things:\n${relatedEntities.join('\n')}`
       : '';
   }
