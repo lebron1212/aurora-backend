@@ -700,6 +700,17 @@ app.post('/nightowl/insights/:id/dismiss', async (req, res) => {
   }
 });
 
+// Clear all insights
+app.delete('/nightowl/insights', async (req, res) => {
+  try {
+    console.log('🦉 [NIGHT OWL] Clearing all insights...');
+    const result = await nightOwl.clearAllInsights();
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Manual Night Owl trigger
 app.post('/nightowl/trigger', async (req, res) => {
   try {
@@ -707,6 +718,113 @@ app.post('/nightowl/trigger', async (req, res) => {
     const result = await nightOwl.process();
     res.json(result);
   } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================================
+// NIGHT OWL CONTEXT DOCUMENT ENDPOINTS
+// ============================================================================
+
+// Get context document
+app.get('/nightowl/context', async (req, res) => {
+  try {
+    const document = await nightOwl.getContextDocument();
+    if (!document) {
+      res.status(404).json({ error: 'No context document found' });
+      return;
+    }
+    res.json({ document });
+  } catch (error) {
+    console.error('❌ [NIGHT OWL] Failed to get context document:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Create/update context document
+app.post('/nightowl/context', async (req, res) => {
+  try {
+    const { document } = req.body;
+    const saved = await nightOwl.saveContextDocument(document);
+    res.json({ document: saved });
+  } catch (error) {
+    console.error('❌ [NIGHT OWL] Failed to save context document:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Reset context document
+app.post('/nightowl/context/reset', async (req, res) => {
+  try {
+    const document = await nightOwl.resetContextDocument();
+    res.json({ document });
+  } catch (error) {
+    console.error('❌ [NIGHT OWL] Failed to reset context document:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Add section to context document
+app.post('/nightowl/context/sections', async (req, res) => {
+  try {
+    const { section } = req.body;
+    const created = await nightOwl.addContextSection(section);
+    res.json({ section: created });
+  } catch (error) {
+    console.error('❌ [NIGHT OWL] Failed to add section:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update a section
+app.put('/nightowl/context/sections/:id', async (req, res) => {
+  try {
+    const { updates } = req.body;
+    const updated = await nightOwl.updateContextSection(req.params.id, updates);
+    if (!updated) {
+      res.status(404).json({ error: 'Section not found' });
+      return;
+    }
+    res.json({ section: updated });
+  } catch (error) {
+    console.error('❌ [NIGHT OWL] Failed to update section:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete a section
+app.delete('/nightowl/context/sections/:id', async (req, res) => {
+  try {
+    const removed = await nightOwl.removeContextSection(req.params.id);
+    if (!removed) {
+      res.status(404).json({ error: 'Section not found' });
+      return;
+    }
+    res.json({ success: true });
+  } catch (error) {
+    console.error('❌ [NIGHT OWL] Failed to delete section:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get compiled context instructions (for debugging/preview)
+app.get('/nightowl/context/preview', async (req, res) => {
+  try {
+    const instructions = await nightOwl.buildContextInstructions();
+    res.json({ instructions });
+  } catch (error) {
+    console.error('❌ [NIGHT OWL] Failed to build context instructions:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Clear context after run (keeps style preferences)
+app.post('/nightowl/context/clear', async (req, res) => {
+  try {
+    const document = await nightOwl.clearContextAfterRun();
+    res.json({ success: true, document });
+  } catch (error) {
+    console.error('❌ [NIGHT OWL] Failed to clear context:', error);
     res.status(500).json({ error: error.message });
   }
 });

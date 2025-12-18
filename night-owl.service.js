@@ -192,6 +192,282 @@ class NightOwlService {
   }
 
   // ============================================================================
+  // CONTEXT DOCUMENT MANAGEMENT
+  // ============================================================================
+
+  /**
+   * Get the context document
+   */
+  async getContextDocument() {
+    try {
+      const doc = await this.crsService.readFile('system/nightowl/context-document.json');
+      return doc;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Create default context document
+   */
+  createDefaultContextDocument() {
+    return {
+      id: `ctx_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      version: 1,
+      primaryDirective: '',
+      sections: [],
+      focusAreas: [],
+      avoidTopics: [],
+      preferredInsightTypes: ['actionable', 'reflective'],
+      tone: 'balanced',
+      depth: 'moderate',
+      frequency: 'moderate',
+      // Clear behavior settings
+      clearDirectiveAfterUse: false,  // Clear primary directive after Night Owl runs
+      clearFocusAreasAfterUse: false, // Clear focus areas after use
+      clearAvoidTopicsAfterUse: false, // Clear avoid topics after use
+      lastSentAt: null,
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    };
+  }
+
+  /**
+   * Save context document
+   */
+  async saveContextDocument(updates) {
+    let doc = await this.getContextDocument();
+
+    if (!doc) {
+      doc = this.createDefaultContextDocument();
+    }
+
+    // Merge updates
+    const updated = {
+      ...doc,
+      ...updates,
+      version: (doc.version || 0) + 1,
+      updatedAt: Date.now()
+    };
+
+    // Preserve sections if not explicitly updated
+    if (updates.sections === undefined && doc.sections) {
+      updated.sections = doc.sections;
+    }
+
+    await this.crsService.writeFile('system/nightowl/context-document.json', updated);
+    console.log(`📋 [NightOwl] Context document saved (v${updated.version})`);
+    return updated;
+  }
+
+  /**
+   * Add a section to the context document
+   */
+  async addContextSection(sectionData) {
+    let doc = await this.getContextDocument();
+    if (!doc) {
+      doc = this.createDefaultContextDocument();
+    }
+
+    const section = {
+      id: `sec_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+      title: sectionData.title,
+      content: sectionData.content,
+      priority: sectionData.priority || 'normal',
+      category: sectionData.category || 'custom',
+      enabled: sectionData.enabled !== false,
+      clearAfterUse: sectionData.clearAfterUse || false,  // One-time instruction
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      createdBy: sectionData.createdBy || 'user'
+    };
+
+    if (!doc.sections) {
+      doc.sections = [];
+    }
+
+    doc.sections.push(section);
+    doc.updatedAt = Date.now();
+    doc.version = (doc.version || 0) + 1;
+
+    await this.crsService.writeFile('system/nightowl/context-document.json', doc);
+    console.log(`📋 [NightOwl] Added section: "${section.title}"${section.clearAfterUse ? ' (one-time)' : ''}`);
+    return section;
+  }
+
+  /**
+   * Update a section
+   */
+  async updateContextSection(sectionId, updates) {
+    const doc = await this.getContextDocument();
+    if (!doc || !doc.sections) return null;
+
+    const index = doc.sections.findIndex(s => s.id === sectionId);
+    if (index === -1) return null;
+
+    doc.sections[index] = {
+      ...doc.sections[index],
+      ...updates,
+      id: sectionId,
+      updatedAt: Date.now()
+    };
+
+    doc.updatedAt = Date.now();
+    doc.version = (doc.version || 0) + 1;
+
+    await this.crsService.writeFile('system/nightowl/context-document.json', doc);
+    console.log(`📋 [NightOwl] Updated section: "${doc.sections[index].title}"`);
+    return doc.sections[index];
+  }
+
+  /**
+   * Remove a section
+   */
+  async removeContextSection(sectionId) {
+    const doc = await this.getContextDocument();
+    if (!doc || !doc.sections) return false;
+
+    const index = doc.sections.findIndex(s => s.id === sectionId);
+    if (index === -1) return false;
+
+    const removed = doc.sections.splice(index, 1)[0];
+    doc.updatedAt = Date.now();
+    doc.version = (doc.version || 0) + 1;
+
+    await this.crsService.writeFile('system/nightowl/context-document.json', doc);
+    console.log(`🗑️ [NightOwl] Removed section: "${removed.title}"`);
+    return true;
+  }
+
+  /**
+   * Reset context document to defaults
+   */
+  async resetContextDocument() {
+    const doc = this.createDefaultContextDocument();
+    await this.crsService.writeFile('system/nightowl/context-document.json', doc);
+    console.log(`🔄 [NightOwl] Context document reset to defaults`);
+    return doc;
+  }
+
+  /**
+   * Build the context string to send to Night Owl processing
+   * This compiles the document into clear instructions and handles clearing
+   */
+  async buildContextInstructions() {
+    const doc = await this.getContextDocument();
+    if (!doc) return '';
+
+    const lines = [];
+    let needsSave = false;
+
+    // Primary directive first
+    if (doc.primaryDirective) {
+      lines.push(`PRIMARY DIRECTIVE: ${doc.primaryDirective}`);
+      lines.push('');
+
+      // Clear if configured to do so
+      if (doc.clearDirectiveAfterUse) {
+        doc.primaryDirective = '';
+        doc.clearDirectiveAfterUse = false;
+        needsSave = true;
+        console.log(`🧹 [NightOwl] Cleared primary directive after use`);
+      }
+    }
+
+    // Focus areas
+    if (doc.focusAreas?.length > 0) {
+      lines.push(`FOCUS AREAS (prioritize these topics): ${doc.focusAreas.join(', ')}`);
+
+      if (doc.clearFocusAreasAfterUse) {
+        doc.focusAreas = [];
+        doc.clearFocusAreasAfterUse = false;
+        needsSave = true;
+        console.log(`🧹 [NightOwl] Cleared focus areas after use`);
+      }
+    }
+
+    // Avoid topics
+    if (doc.avoidTopics?.length > 0) {
+      lines.push(`AVOID TOPICS (do not surface insights about): ${doc.avoidTopics.join(', ')}`);
+
+      if (doc.clearAvoidTopicsAfterUse) {
+        doc.avoidTopics = [];
+        doc.clearAvoidTopicsAfterUse = false;
+        needsSave = true;
+        console.log(`🧹 [NightOwl] Cleared avoid topics after use`);
+      }
+    }
+
+    // Style preferences
+    lines.push(`TONE: ${doc.tone || 'balanced'}`);
+    lines.push(`ANALYSIS DEPTH: ${doc.depth || 'moderate'}`);
+    lines.push(`INSIGHT FREQUENCY: ${doc.frequency || 'moderate'}`);
+
+    // Process enabled sections by priority
+    const enabledSections = (doc.sections || [])
+      .filter(s => s.enabled)
+      .sort((a, b) => {
+        const priorityOrder = { critical: 0, high: 1, normal: 2, low: 3 };
+        return (priorityOrder[a.priority] || 2) - (priorityOrder[b.priority] || 2);
+      });
+
+    // Track sections to remove after use
+    const sectionsToRemove = [];
+
+    if (enabledSections.length > 0) {
+      lines.push('');
+      lines.push('ADDITIONAL INSTRUCTIONS:');
+      for (const section of enabledSections) {
+        const priorityLabel = section.priority === 'critical' ? '[CRITICAL] ' :
+          section.priority === 'high' ? '[HIGH] ' : '';
+        const oneTimeLabel = section.clearAfterUse ? ' (one-time)' : '';
+        lines.push(`${priorityLabel}${section.title}${oneTimeLabel}: ${section.content}`);
+
+        // Mark for removal if it's a one-time section
+        if (section.clearAfterUse) {
+          sectionsToRemove.push(section.id);
+        }
+      }
+    }
+
+    // Remove one-time sections
+    if (sectionsToRemove.length > 0) {
+      doc.sections = doc.sections.filter(s => !sectionsToRemove.includes(s.id));
+      needsSave = true;
+      console.log(`🧹 [NightOwl] Cleared ${sectionsToRemove.length} one-time section(s) after use`);
+    }
+
+    // Update last sent timestamp
+    doc.lastSentAt = Date.now();
+    doc.updatedAt = Date.now();
+
+    // Save if anything changed
+    await this.crsService.writeFile('system/nightowl/context-document.json', doc);
+
+    return lines.join('\n');
+  }
+
+  /**
+   * Clear all context (full reset but keep style preferences)
+   */
+  async clearContextAfterRun() {
+    const doc = await this.getContextDocument();
+    if (!doc) return;
+
+    // Clear content but keep style preferences
+    doc.primaryDirective = '';
+    doc.focusAreas = [];
+    doc.avoidTopics = [];
+    doc.sections = [];
+    doc.updatedAt = Date.now();
+    doc.version = (doc.version || 0) + 1;
+
+    await this.crsService.writeFile('system/nightowl/context-document.json', doc);
+    console.log(`🧹 [NightOwl] Cleared all context after run (kept style preferences)`);
+    return doc;
+  }
+
+  // ============================================================================
   // MAIN PROCESSING
   // ============================================================================
 
@@ -200,7 +476,7 @@ class NightOwlService {
    */
   async processAll() {
     await this.initialize();
-    
+
     if (!this.settings.enabled) {
       console.log('🦉 [NightOwl] Disabled. Skipping.');
       return { success: true, insightCount: 0, skipped: true, reason: 'disabled' };
@@ -226,7 +502,7 @@ class NightOwlService {
       // ============================================================
       const queuedInsights = await this.processQueuedRequests(userContext, healthData, trackingData);
       allInsights.push(...queuedInsights);
-      
+
       // If user queued something, resume autonomous for next time
       if (queuedInsights.length > 0 && this.settings.processQueuedOnly) {
         console.log('🦉 [NightOwl] User queued requests - will resume autonomous next run');
@@ -238,7 +514,7 @@ class NightOwlService {
       // ============================================================
       if (this.shouldRunAutonomous()) {
         console.log('🦉 [NightOwl] Running autonomous processors...');
-        
+
         const remaining = this.settings.maxInsightsPerNight - allInsights.length;
         if (remaining > 0) {
           const autonomous = await this.runAutonomousProcessors(userContext, healthData, trackingData, remaining);
@@ -251,10 +527,10 @@ class NightOwlService {
       // ============================================================
       // PHASE 3: SAVE & NOTIFY
       // ============================================================
-      
+
       // Dedupe by loopId (don't analyze same thing twice)
       const deduped = this.dedupeInsights(allInsights);
-      
+
       // Save all insights
       for (const insight of deduped) {
         await this.saveInsight(insight);
@@ -267,6 +543,12 @@ class NightOwlService {
       if (deduped.length > 0 && this.settings.notificationsEnabled) {
         await this.queueNotification(deduped);
       }
+
+      // ============================================================
+      // PHASE 4: CLEAR CONTEXT DOCUMENT
+      // ============================================================
+      // Clear the context doc after processing so it's fresh for next time
+      await this.clearContextAfterRun();
 
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
       console.log(`🦉 [NightOwl] Complete in ${elapsed}s. ${deduped.length} insights generated.`);
@@ -303,12 +585,12 @@ class NightOwlService {
    */
   async processQueuedRequests(userContext, healthData, trackingData) {
     const insights = [];
-    
+
     try {
       // Read queued requests
       const queueFile = await this.crsService.readFile('system/nightowl/queue.json').catch(() => null);
       const queue = queueFile?.requests?.filter(r => r.status === 'pending') || [];
-      
+
       if (queue.length === 0) {
         console.log('🦉 [NightOwl] No queued requests.');
         return insights;
@@ -325,12 +607,12 @@ class NightOwlService {
       for (const request of sorted) {
         try {
           console.log(`🦉 [NightOwl] Processing queued: "${request.request}" (${request.type})`);
-          
+
           const insight = await this.processQueuedRequest(request, userContext, healthData, trackingData);
-          
+
           if (insight) {
             insights.push(insight);
-            
+
             // Mark request as completed
             request.status = 'completed';
             request.result = insight.content;
@@ -347,7 +629,7 @@ class NightOwlService {
       }
 
       // Save updated queue
-      await this.crsService.writeFile('system/nightowl/queue.json', { 
+      await this.crsService.writeFile('system/nightowl/queue.json', {
         requests: queueFile?.requests || queue,
         lastProcessed: Date.now()
       });
@@ -363,7 +645,7 @@ class NightOwlService {
    * Process a single queued request
    */
   async processQueuedRequest(request, userContext, healthData, trackingData) {
-    
+
     // Build data context based on requested sources
     const dataContext = this.buildDataContext(request.dataSources || ['all'], {
       userContext,
@@ -450,7 +732,7 @@ Please provide your analysis.`;
     if (includeAll || sources.includes('tracking') || sources.includes('metrics') || sources.includes('habits')) {
       if (trackingData.available) {
         const { metrics, habits, activities } = trackingData;
-        
+
         if (Object.keys(metrics).length > 0) {
           parts.push('\n## Tracked Metrics (30 days)');
           for (const [name, values] of Object.entries(metrics)) {
@@ -459,13 +741,13 @@ Please provide your analysis.`;
             parts.push(`${name}: avg ${avg.toFixed(1)}, recent: ${recent.slice(-7).map(v => v.value).join(', ')}`);
           }
         }
-        
+
         if (Object.keys(habits).length > 0) {
           parts.push('\n## Habit Tracking (30 days)');
           for (const [name, values] of Object.entries(habits)) {
             const recent = values.slice(-30);
             const completed = recent.filter(v => v.completed).length;
-            parts.push(`${name}: ${completed}/${recent.length} days (${Math.round(completed/recent.length*100)}%)`);
+            parts.push(`${name}: ${completed}/${recent.length} days (${Math.round(completed / recent.length * 100)}%)`);
           }
         }
 
@@ -481,7 +763,7 @@ Please provide your analysis.`;
       if (healthData.available) {
         if (healthData.sleep?.length > 0) {
           parts.push('\n## Sleep Data (7 days)');
-          parts.push(healthData.sleep.slice(-7).map(s => 
+          parts.push(healthData.sleep.slice(-7).map(s =>
             `${s.date}: ${s.duration}hrs, quality: ${s.quality || 'unknown'}`
           ).join('\n'));
         }
@@ -557,9 +839,9 @@ Please provide your analysis.`;
     const queueFile = await this.crsService.readFile('system/nightowl/queue.json').catch(() => ({ requests: [] }));
     const pending = queueFile.requests?.filter(r => r.status === 'pending') || [];
     const completed = queueFile.requests?.filter(r => r.status === 'completed') || [];
-    
+
     const undelivered = await this.getPendingInsights();
-    
+
     return {
       pending,
       completed: completed.slice(-10),  // Last 10 completed
@@ -594,12 +876,12 @@ Please provide your analysis.`;
 
     for (const processor of processors) {
       if (insights.length >= maxInsights) break;
-      
+
       try {
         const result = await processor.fn();
         const toAdd = result.slice(0, maxInsights - insights.length);
         insights.push(...toAdd);
-        
+
         if (toAdd.length > 0) {
           console.log(`🦉 [NightOwl] ${processor.name}: ${toAdd.length} insights`);
         }
@@ -617,7 +899,7 @@ Please provide your analysis.`;
   async processMilestones(userContext) {
     const loops = await this.crsService.loadExistingSystemFiles('open_loops');
     const milestones = loops.filter(l => l.status === 'open' && l.isMilestone);
-    
+
     const insights = [];
     for (const milestone of milestones.slice(0, 2)) {
       const insight = await this.prepareMilestone(milestone, userContext);
@@ -642,7 +924,7 @@ Please provide your analysis.`;
   async getTrackingDataFromStore() {
     try {
       const trackingFile = await this.crsService.readFile('system/tracking/entries.json').catch(() => null);
-      
+
       if (!trackingFile?.entries) {
         return { metrics: {}, habits: {}, activities: [], available: false };
       }
@@ -688,8 +970,8 @@ Please provide your analysis.`;
       insightCount: insights.length,
       insightTypes: [...new Set(insights.map(i => i.insightType))],
       createdAt: Date.now(),
-      scheduledFor: this.settings.notificationTiming === 'immediate' 
-        ? Date.now() 
+      scheduledFor: this.settings.notificationTiming === 'immediate'
+        ? Date.now()
         : this.getNextMorningTime(),
       sent: false,
       message: this.generateNotificationMessage(insights)
@@ -703,12 +985,12 @@ Please provide your analysis.`;
     const now = new Date();
     const morning = new Date();
     morning.setHours(this.settings.morningHour, 0, 0, 0);
-    
+
     // If it's already past morning, schedule for tomorrow
     if (now.getHours() >= this.settings.morningHour) {
       morning.setDate(morning.getDate() + 1);
     }
-    
+
     return morning.getTime();
   }
 
@@ -716,9 +998,9 @@ Please provide your analysis.`;
     const count = insights.length;
     const hasMilestone = insights.some(i => i.insightType === 'milestone_prep');
     const hasQueued = insights.some(i => i.isQueued);
-    
+
     let body;
-    
+
     if (hasQueued && count === 1) {
       body = `I finished that analysis you asked about. Ready when you are.`;
     } else if (hasMilestone) {
@@ -946,16 +1228,329 @@ Reply with ONLY the category name, nothing else.`
   }
 
   // ============================================================================
-  // RESEARCH (with web search)
+  // ITERATIVE RESEARCH SYSTEM
   // ============================================================================
 
+  /**
+   * Main entry point for research -  iterative
+   */
   async doResearch(loop, userContext) {
-    console.log(`🔍 [NightOwl] Researching: "${loop.title}"`);
+    console.log(`🔍 [NightOwl] Starting iterative research: "${loop.title}"`);
 
-    // Build context about user preferences
+    const config = {
+      maxIterations: 3,
+      maxSubQuestions: 5,
+      maxSearchesPerIteration: 3
+    };
+
+    try {
+      // Build context once
+      const userPrefs = this.buildUserPreferencesContext(userContext);
+      const relatedContext = await this.getRelatedEntitiesContext(loop.relatedEntityIds || [], userContext);
+
+      // PHASE 1: Plan the research
+      console.log(`📋 [NightOwl] Planning research approach...`);
+      const researchPlan = await this.planResearch(loop, userPrefs, relatedContext);
+
+      if (!researchPlan || researchPlan.subQuestions.length === 0) {
+        console.warn(`⚠️ [NightOwl] Could not generate research plan, falling back to simple research`);
+        return await this.doSimpleResearch(loop, userContext);
+      }
+
+      console.log(`📋 [NightOwl] Research plan: ${researchPlan.subQuestions.length} sub-questions`);
+
+      // PHASE 2 & 3: Execute and iterate
+      const allFindings = [];
+      let iteration = 0;
+      let questionsToResearch = researchPlan.subQuestions.slice(0, config.maxSubQuestions);
+
+      while (iteration < config.maxIterations && questionsToResearch.length > 0) {
+        iteration++;
+        console.log(`🔄 [NightOwl] Research iteration ${iteration}/${config.maxIterations}`);
+
+        // Research each question in this iteration
+        const iterationFindings = await this.executeResearchIteration(
+          questionsToResearch,
+          loop,
+          userPrefs,
+          config.maxSearchesPerIteration
+        );
+
+        allFindings.push(...iterationFindings);
+
+        // Evaluate gaps and determine if we need another iteration
+        if (iteration < config.maxIterations) {
+          const gaps = await this.evaluateResearchGaps(
+            loop,
+            allFindings,
+            researchPlan.successCriteria,
+            userPrefs
+          );
+
+          if (gaps.length === 0) {
+            console.log(`✅ [NightOwl] Research complete - no significant gaps`);
+            break;
+          }
+
+          console.log(`🔍 [NightOwl] Found ${gaps.length} gaps to investigate`);
+          questionsToResearch = gaps.slice(0, config.maxSubQuestions);
+        }
+      }
+
+      // PHASE 4: Synthesize all findings
+      console.log(`📝 [NightOwl] Synthesizing ${allFindings.length} findings...`);
+      const synthesis = await this.synthesizeResearchFindings(
+        loop,
+        allFindings,
+        researchPlan,
+        userPrefs,
+        relatedContext
+      );
+
+      // Collect all sources
+      const allSources = [...new Set(allFindings.flatMap(f => f.sources || []))];
+
+      return {
+        id: this.generateId('insight'),
+        loopId: loop.id,
+        loopTitle: loop.title,
+        insightType: 'research',
+        content: synthesis,
+        conversationHook: this.generateConversationHook(loop, 'research'),
+        sources: allSources,
+        metadata: {
+          iterations: iteration,
+          subQuestionsResearched: allFindings.length,
+          researchPlan: researchPlan.subQuestions
+        },
+        createdAt: Date.now(),
+        status: 'pending'
+      };
+
+    } catch (error) {
+      console.error(`❌ [NightOwl] Iterative research failed:`, error.message);
+      // Fall back to simple research
+      return await this.doSimpleResearch(loop, userContext);
+    }
+  }
+
+  /**
+   * PHASE 1: Break down research into sub-questions
+   */
+  async planResearch(loop, userPrefs, relatedContext) {
+    const response = await this.anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1000,
+      messages: [{
+        role: 'user',
+        content: `Break down this research task into specific sub-questions.
+
+RESEARCH TOPIC: ${loop.title}
+${loop.description ? `DETAILS: ${loop.description}` : ''}
+
+USER CONTEXT:
+${userPrefs}
+
+${relatedContext ? `RELATED CONTEXT:\n${relatedContext}` : ''}
+
+Generate 3-5 specific, searchable sub-questions that would thoroughly research this topic.
+Consider what the user specifically needs given their context.
+
+Respond in this exact JSON format:
+{
+  "subQuestions": [
+    {"question": "specific question 1", "priority": 1, "rationale": "why this matters"},
+    {"question": "specific question 2", "priority": 2, "rationale": "why this matters"}
+  ],
+  "successCriteria": ["what would make this research complete"],
+  "userSpecificAngles": ["aspects to emphasize given user context"]
+}`
+      }],
+      system: 'You are a research planner. Break down research tasks into specific, searchable questions. Respond only with valid JSON.'
+    });
+
+    try {
+      const text = response.content[0]?.text || '';
+      // Extract JSON from response (handle markdown code blocks)
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        return JSON.parse(jsonMatch[0]);
+      }
+    } catch (e) {
+      console.warn(`⚠️ [NightOwl] Failed to parse research plan:`, e.message);
+    }
+
+    return null;
+  }
+
+  /**
+   * PHASE 2: Execute one iteration of research
+   */
+  async executeResearchIteration(questions, loop, userPrefs, maxSearches) {
+    const findings = [];
+
+    for (const q of questions.slice(0, maxSearches)) {
+      const question = typeof q === 'string' ? q : q.question;
+      console.log(`  🔎 Researching: "${question.substring(0, 50)}..."`);
+
+      try {
+        const response = await this.anthropic.messages.create({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 1500,
+          tools: [{ type: 'web_search_20250305' }],
+          messages: [{
+            role: 'user',
+            content: `Research this specific question thoroughly:
+
+QUESTION: ${question}
+
+BROADER CONTEXT: This is part of researching "${loop.title}"
+
+USER CONTEXT:
+${userPrefs}
+
+Provide:
+1. Direct answer to the question with specific facts/data
+2. Key sources and their credibility
+3. Any caveats or things to verify
+4. Related information that might be useful
+
+Be specific and factual. Include numbers, names, and concrete details where available.`
+          }],
+          system: 'You are a thorough researcher. Provide specific, factual answers with concrete details. Use web search to find current information.'
+        });
+
+        const { text, sources } = this.extractResponseContent(response);
+
+        findings.push({
+          question,
+          answer: text,
+          sources,
+          timestamp: Date.now()
+        });
+
+      } catch (error) {
+        console.warn(`  ⚠️ Failed to research "${question}":`, error.message);
+      }
+    }
+
+    return findings;
+  }
+
+  /**
+   * PHASE 3: Evaluate what's missing
+   */
+  async evaluateResearchGaps(loop, findings, successCriteria, userPrefs) {
+    const findingsSummary = findings.map(f =>
+      `Q: ${f.question}\nA: ${f.answer.substring(0, 500)}...`
+    ).join('\n\n');
+
+    const response = await this.anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 800,
+      messages: [{
+        role: 'user',
+        content: `Evaluate this research and identify gaps.
+
+ORIGINAL TOPIC: ${loop.title}
+${loop.description ? `DETAILS: ${loop.description}` : ''}
+
+SUCCESS CRITERIA:
+${(successCriteria || []).map(c => `- ${c}`).join('\n') || '- Comprehensive, actionable information'}
+
+USER CONTEXT:
+${userPrefs}
+
+RESEARCH COMPLETED:
+${findingsSummary}
+
+What important questions remain unanswered? What needs deeper investigation?
+Only list gaps that are significant and would meaningfully improve the research.
+
+Respond in JSON format:
+{
+  "gaps": [
+    {"question": "unanswered question", "importance": "high/medium", "reason": "why this matters"}
+  ],
+  "completeness": 0.0-1.0,
+  "assessment": "brief assessment of research quality"
+}`
+      }],
+      system: 'You are a research evaluator. Identify meaningful gaps, not trivial ones. Respond only with valid JSON.'
+    });
+
+    try {
+      const text = response.content[0]?.text || '';
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const evaluation = JSON.parse(jsonMatch[0]);
+
+        // Only return gaps if completeness is below threshold
+        if (evaluation.completeness < 0.8) {
+          return (evaluation.gaps || [])
+            .filter(g => g.importance === 'high' || g.importance === 'medium')
+            .map(g => g.question);
+        }
+      }
+    } catch (e) {
+      console.warn(`⚠️ [NightOwl] Failed to parse gap evaluation`);
+    }
+
+    return [];
+  }
+
+  /**
+   * PHASE 4: Synthesize all findings into coherent insight
+   */
+  async synthesizeResearchFindings(loop, findings, researchPlan, userPrefs, relatedContext) {
+    const findingsText = findings.map(f =>
+      `### ${f.question}\n${f.answer}`
+    ).join('\n\n');
+
+    const response = await this.anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 2000,
+      messages: [{
+        role: 'user',
+        content: `Synthesize this research into a helpful, personalized summary.
+
+ORIGINAL TOPIC: ${loop.title}
+${loop.description ? `DETAILS: ${loop.description}` : ''}
+
+USER CONTEXT:
+${userPrefs}
+
+${relatedContext ? `RELATED CONTEXT:\n${relatedContext}` : ''}
+
+USER-SPECIFIC ANGLES TO EMPHASIZE:
+${(researchPlan?.userSpecificAngles || []).map(a => `- ${a}`).join('\n') || '- General helpfulness'}
+
+RESEARCH FINDINGS:
+${findingsText}
+
+Create a cohesive summary that:
+1. Directly addresses what the user needs to know
+2. Is personalized to their context and preferences
+3. Highlights the most actionable information
+4. Organizes information logically (not just question-by-question)
+5. Calls out any important caveats or decisions they need to make
+6. Suggests concrete next steps
+
+Write conversationally - this will be delivered in a chat. Don't use headers like "Summary:" - just provide the helpful content.`
+      }],
+      system: 'You are synthesizing research into a helpful, personalized summary. Be conversational and actionable. Focus on what matters most to this specific user.'
+    });
+
+    return response.content[0]?.text?.trim() || 'Research synthesis failed.';
+  }
+
+  /**
+   * Fallback: Simple single-shot research (original behavior)
+   */
+  async doSimpleResearch(loop, userContext) {
+    console.log(`🔍 [NightOwl] Falling back to simple research: "${loop.title}"`);
+
     const userPrefs = this.buildUserPreferencesContext(userContext);
-
-    // Get related entities for more context
     const relatedContext = await this.getRelatedEntitiesContext(loop.relatedEntityIds || [], userContext);
 
     const systemPrompt = `You are a thoughtful personal assistant doing background research to help with planning and decision-making. 
@@ -965,12 +1560,6 @@ Your research should be:
 - Personalized to the user's preferences and situation
 - Well-sourced from current information
 - Organized in a way that's easy to digest
-
-When presenting research, structure it as:
-1. Key findings relevant to their situation
-2. Specific recommendations based on their preferences
-3. Things to consider or watch out for
-4. Next steps they could take
 
 Be conversational but informative. This will be delivered naturally in a future conversation.`;
 
@@ -983,22 +1572,17 @@ USER CONTEXT:
 ${userPrefs}
 ${relatedContext}
 
-Please research this thoroughly and provide practical, personalized findings. Use web search to find current, relevant information.
-
-Focus on what would actually help them make progress on this.`;
+Please research this thoroughly and provide practical, personalized findings. Use web search to find current, relevant information.`;
 
     try {
       const response = await this.anthropic.messages.create({
         model: 'claude-sonnet-4-20250514',
         max_tokens: 2000,
         tools: [{ type: 'web_search_20250305' }],
-        messages: [
-          { role: 'user', content: userPrompt }
-        ],
+        messages: [{ role: 'user', content: userPrompt }],
         system: systemPrompt
       });
 
-      // Extract text and sources from response
       const { text, sources } = this.extractResponseContent(response);
 
       return {
@@ -1014,7 +1598,7 @@ Focus on what would actually help them make progress on this.`;
       };
 
     } catch (error) {
-      console.error(`❌ [NightOwl] Research failed:`, error.message);
+      console.error(`❌ [NightOwl] Simple research failed:`, error.message);
       return null;
     }
   }
@@ -2193,123 +2777,503 @@ Reply with ONLY the option name.`
     }
   }
 
+  // ============================================================================
+  // ITERATIVE PLAN RESEARCH SYSTEM
+  // ============================================================================
+
+  /**
+   * Research a plan iteratively - discovers user context, researches solutions,
+   * filters for fit, and creates actionable steps
+   */
   async researchPlan(plan, userContext) {
-    console.log(`🔍 [NightOwl] Researching plan: "${plan.title}"`);
+    console.log(`🔍 [NightOwl] Starting iterative plan research: "${plan.title}"`);
 
-    const systemPrompt = `You are a research assistant helping someone develop their plan by gathering information and insights.
-
-Your research should:
-- Provide practical, actionable information
-- Consider the person's context and constraints
-- Offer multiple approaches or options where relevant
-- Be specific and detailed enough to be useful
-- Include current, relevant information from web search
-
-Structure your response as:
-1. Key research findings
-2. Practical approaches they could take
-3. Important considerations or potential challenges
-4. Specific next steps they could take
-
-Be thorough but focused on actionable insights.`;
-
-    const userPrompt = `I need deep research on this plan:
-
-PLAN: ${plan.title}
-${plan.description ? `Details: ${plan.description}` : ''}
-
-USER CONTEXT:
-${this.buildUserPreferencesContext(userContext)}
-
-Please research this thoroughly and provide:
-- Current best practices and approaches
-- Multiple options they could pursue
-- Key considerations for their situation
-- Specific, actionable next steps
-
-Use web search to find current, relevant information.`;
+    const config = {
+      maxIterations: 3,
+      maxQuestionsPerPhase: 4
+    };
 
     try {
-      const response = await this.anthropic.messages.create({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 2000,
-        tools: [{ type: 'web_search_20250305' }],
-        messages: [{ role: 'user', content: userPrompt }],
-        system: systemPrompt
-      });
+      // PHASE 1: Discover what we know about the user relevant to this plan
+      console.log(`🔎 [NightOwl] Phase 1: Discovering user context...`);
+      const userDiscovery = await this.discoverRelevantUserContext(plan, userContext);
 
-      const { text, sources } = this.extractResponseContent(response);
+      // PHASE 2: Diagnose - what are the key questions/factors for this plan?
+      console.log(`🔎 [NightOwl] Phase 2: Diagnosing key factors...`);
+      const diagnosis = await this.diagnosePlanFactors(plan, userDiscovery, userContext);
+
+      // PHASE 3: Research solutions iteratively
+      console.log(`🔎 [NightOwl] Phase 3: Researching solutions...`);
+      const allFindings = [];
+      let questionsToResearch = diagnosis.researchQuestions.slice(0, config.maxQuestionsPerPhase);
+      let iteration = 0;
+
+      while (iteration < config.maxIterations && questionsToResearch.length > 0) {
+        iteration++;
+        console.log(`  🔄 Research iteration ${iteration}/${config.maxIterations}`);
+
+        const findings = await this.executeResearchIteration(
+          questionsToResearch,
+          plan,
+          this.buildUserPreferencesContext(userContext),
+          config.maxQuestionsPerPhase
+        );
+
+        allFindings.push(...findings);
+
+        // Check for gaps
+        if (iteration < config.maxIterations) {
+          const gaps = await this.evaluatePlanResearchGaps(
+            plan,
+            allFindings,
+            diagnosis,
+            userDiscovery
+          );
+
+          if (gaps.length === 0) {
+            console.log(`  ✅ Research complete`);
+            break;
+          }
+
+          questionsToResearch = gaps.slice(0, config.maxQuestionsPerPhase);
+        }
+      }
+
+      // PHASE 4: Filter and personalize
+      console.log(`🔎 [NightOwl] Phase 4: Filtering for user fit...`);
+      const filteredPlan = await this.filterAndPersonalizePlan(
+        plan,
+        allFindings,
+        userDiscovery,
+        diagnosis,
+        userContext
+      );
+
+      // Collect sources
+      const allSources = [...new Set(allFindings.flatMap(f => f.sources || []))];
 
       return {
         id: this.generateId('plan_insight'),
         loopId: plan.id,
         loopTitle: plan.title,
         insightType: 'plan_research',
-        content: text,
-        conversationHook: await this.generatePlanConversationHook(plan, 'research', text),
-        sources,
+        content: filteredPlan,
+        conversationHook: await this.generatePlanConversationHook(plan, 'research', filteredPlan),
+        sources: allSources,
+        metadata: {
+          iterations: iteration,
+          questionsResearched: allFindings.length,
+          userFactorsConsidered: userDiscovery.relevantFactors,
+          diagnosis: diagnosis.summary
+        },
         createdAt: Date.now(),
         status: 'pending'
       };
 
     } catch (error) {
-      console.error(`❌ [NightOwl] Plan research failed:`, error.message);
-      return null;
+      console.error(`❌ [NightOwl] Iterative plan research failed:`, error.message);
+      return await this.doSimplePlanResearch(plan, userContext);
     }
   }
 
-  async refinePlan(plan, userContext) {
-    console.log(`🎨 [NightOwl] Refining plan: "${plan.title}"`);
+  /**
+   * PHASE 1: Discover what we know about the user relevant to this plan
+   */
+  async discoverRelevantUserContext(plan, userContext) {
+    const { relevantFacts, relevantEntities, patterns } = userContext;
 
-    const systemPrompt = `You are a strategic advisor helping someone refine and improve their plan.
-
-Your refinement should:
-- Make the plan more specific and actionable
-- Identify potential improvements or optimizations
-- Suggest better approaches based on current best practices
-- Help them anticipate and prepare for challenges
-- Connect the plan to their broader goals and context
-
-Be strategic and thoughtful, focusing on making the plan more effective.`;
-
-    const userPrompt = `Help refine this plan:
+    // Let Claude identify what's relevant
+    const response = await this.anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1200,
+      messages: [{
+        role: 'user',
+        content: `Analyze what we know about this user that's relevant to their plan.
 
 PLAN: ${plan.title}
-${plan.description ? `Current approach: ${plan.description}` : ''}
+${plan.description ? `DETAILS: ${plan.description}` : ''}
 
-USER CONTEXT:
-${this.buildUserPreferencesContext(userContext)}
+USER FACTS:
+${(relevantFacts || []).slice(0, 30).map(f => `- [${f.category || 'general'}] ${f.content}`).join('\n') || 'No facts recorded'}
 
-THEIR PATTERNS:
-${this.buildPatternsContext(userContext)}
+USER PATTERNS:
+${(patterns || []).map(p => `- ${p.claim} (${p.domain})`).join('\n') || 'No patterns identified'}
 
-Please provide:
-1. Specific improvements to make the plan more effective
-2. Better approaches they might not have considered
-3. Ways to anticipate and handle potential challenges
-4. How to connect this plan to their broader goals
-5. Concrete next steps with clear milestones
+ENTITIES IN THEIR LIFE:
+${(relevantEntities || []).slice(0, 10).map(e => `- ${e.name} (${e.category}): ${e.description || 'no description'}`).join('\n') || 'None recorded'}
 
-Make the plan more strategic and actionable.`;
+Identify:
+1. What relevant information do we HAVE about them for this plan?
+2. What relevant information are we MISSING that would help?
+3. What constraints or preferences should we account for?
+4. Any patterns that might affect success?
+
+Respond in JSON:
+{
+  "relevantFactors": ["factor1", "factor2"],
+  "knownConstraints": ["budget-conscious", "time-limited", etc],
+  "knownPreferences": ["prefers natural products", etc],
+  "missingInformation": ["skin type unknown", "current routine unknown", etc],
+  "relevantPatterns": ["tends to start strong then fade", etc],
+  "summary": "Brief synthesis of what we know"
+}`
+      }],
+      system: 'You are analyzing user data to understand their context for a plan. Be specific about what we know vs don\'t know. Respond only with valid JSON.'
+    });
 
     try {
+      const text = response.content[0]?.text || '';
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        return JSON.parse(jsonMatch[0]);
+      }
+    } catch (e) {
+      console.warn(`⚠️ [NightOwl] Failed to parse user discovery`);
+    }
+
+    return {
+      relevantFactors: [],
+      knownConstraints: [],
+      knownPreferences: [],
+      missingInformation: ['Unable to analyze user context'],
+      relevantPatterns: [],
+      summary: 'Could not analyze user context'
+    };
+  }
+
+  /**
+   * PHASE 2: Diagnose key factors and generate research questions
+   */
+  async diagnosePlanFactors(plan, userDiscovery, userContext) {
+    const response = await this.anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 1500,
+      tools: [{ type: 'web_search_20250305' }],
+      messages: [{
+        role: 'user',
+        content: `Diagnose the key factors for this plan and generate research questions.
+
+PLAN: ${plan.title}
+${plan.description ? `DETAILS: ${plan.description}` : ''}
+
+WHAT WE KNOW ABOUT THE USER:
+${userDiscovery.summary}
+
+Known constraints: ${userDiscovery.knownConstraints.join(', ') || 'none identified'}
+Known preferences: ${userDiscovery.knownPreferences.join(', ') || 'none identified'}
+Missing information: ${userDiscovery.missingInformation.join(', ') || 'none'}
+Relevant patterns: ${userDiscovery.relevantPatterns.join(', ') || 'none'}
+
+Based on current best practices and the user's situation:
+1. What are the key factors/variables that determine success for this type of plan?
+2. What are the main approaches or schools of thought?
+3. What specific research questions should we investigate given THEIR situation?
+
+Use web search to understand current best practices before generating questions.
+
+Respond in JSON:
+{
+  "keyFactors": ["factor1 and why it matters", "factor2 and why it matters"],
+  "mainApproaches": [
+    {"name": "approach1", "description": "what it involves", "bestFor": "who it's best for"}
+  ],
+  "researchQuestions": [
+    {"question": "specific searchable question", "priority": 1, "rationale": "why this matters for them"}
+  ],
+  "hypotheses": ["Based on what we know, X approach might work because Y"],
+  "summary": "Brief diagnosis of their situation"
+}`
+      }],
+      system: 'You are diagnosing a plan to understand what research is needed. Use web search to ground your diagnosis in current best practices. Respond only with valid JSON.'
+    });
+
+    try {
+      const text = response.content[0]?.text || '';
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        return JSON.parse(jsonMatch[0]);
+      }
+    } catch (e) {
+      console.warn(`⚠️ [NightOwl] Failed to parse diagnosis`);
+    }
+
+    // Fallback
+    return {
+      keyFactors: [],
+      mainApproaches: [],
+      researchQuestions: [{ question: `How to ${plan.title}`, priority: 1, rationale: 'Main question' }],
+      hypotheses: [],
+      summary: 'Could not complete diagnosis'
+    };
+  }
+
+  /**
+   * Evaluate gaps specific to plan research
+   */
+  async evaluatePlanResearchGaps(plan, findings, diagnosis, userDiscovery) {
+    const findingsSummary = findings.map(f =>
+      `Q: ${f.question}\nA: ${f.answer.substring(0, 400)}...`
+    ).join('\n\n');
+
+    const response = await this.anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 800,
+      messages: [{
+        role: 'user',
+        content: `Evaluate research completeness for creating an actionable plan.
+
+PLAN: ${plan.title}
+
+USER'S SITUATION:
+${userDiscovery.summary}
+Constraints: ${userDiscovery.knownConstraints.join(', ') || 'none'}
+Preferences: ${userDiscovery.knownPreferences.join(', ') || 'none'}
+
+KEY FACTORS IDENTIFIED:
+${diagnosis.keyFactors.join('\n')}
+
+RESEARCH COMPLETED:
+${findingsSummary}
+
+Can we create an actionable, personalized plan with this research?
+What critical gaps remain that would significantly improve the plan?
+
+Respond in JSON:
+{
+  "gaps": [
+    {"question": "what we still need to know", "importance": "high/medium", "reason": "why"}
+  ],
+  "completeness": 0.0-1.0,
+  "canCreatePlan": true/false,
+  "assessment": "brief assessment"
+}`
+      }],
+      system: 'Evaluate if research is sufficient for an actionable plan. Only flag gaps that would meaningfully improve it. Respond only with valid JSON.'
+    });
+
+    try {
+      const text = response.content[0]?.text || '';
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const evaluation = JSON.parse(jsonMatch[0]);
+
+        if (evaluation.completeness >= 0.75 || evaluation.canCreatePlan) {
+          return [];
+        }
+
+        return (evaluation.gaps || [])
+          .filter(g => g.importance === 'high')
+          .map(g => g.question);
+      }
+    } catch (e) {
+      console.warn(`⚠️ [NightOwl] Failed to parse gap evaluation`);
+    }
+
+    return [];
+  }
+
+  /**
+   * PHASE 4: Filter findings and create personalized plan
+   */
+  async filterAndPersonalizePlan(plan, findings, userDiscovery, diagnosis, userContext) {
+    const findingsText = findings.map(f =>
+      `### ${f.question}\n${f.answer}`
+    ).join('\n\n');
+
+    const response = await this.anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 2500,
+      messages: [{
+        role: 'user',
+        content: `Create a personalized, actionable plan based on this research.
+
+GOAL: ${plan.title}
+${plan.description ? `CONTEXT: ${plan.description}` : ''}
+
+USER'S SITUATION:
+${userDiscovery.summary}
+
+CONSTRAINTS TO WORK WITHIN:
+${userDiscovery.knownConstraints.map(c => `- ${c}`).join('\n') || '- None identified'}
+
+PREFERENCES TO HONOR:
+${userDiscovery.knownPreferences.map(p => `- ${p}`).join('\n') || '- None identified'}
+
+PATTERNS TO ACCOUNT FOR:
+${userDiscovery.relevantPatterns.map(p => `- ${p}`).join('\n') || '- None identified'}
+
+HYPOTHESES ABOUT WHAT MIGHT WORK FOR THEM:
+${diagnosis.hypotheses.map(h => `- ${h}`).join('\n') || '- No specific hypotheses'}
+
+RESEARCH FINDINGS:
+${findingsText}
+
+Create a personalized plan that:
+1. Is specifically tailored to THEIR situation, constraints, and preferences
+2. Accounts for their patterns (e.g., if they tend to fade, build in accountability)
+3. Starts with quick wins to build momentum
+4. Has clear, concrete steps (not vague advice)
+5. Includes specific product/resource recommendations where appropriate
+6. Explains WHY each recommendation fits them specifically
+7. Acknowledges what we don't know and how they can figure it out
+8. Has a realistic timeline
+
+Write conversationally - this will be delivered in chat. Don't use generic headers like "Personalized Plan:" - just provide the helpful, specific content.`
+      }],
+      system: 'Create a highly personalized, actionable plan. Every recommendation should be justified by their specific situation. Be concrete and specific, not generic.'
+    });
+
+    return response.content[0]?.text?.trim() || 'Could not create personalized plan.';
+  }
+
+  /**
+   * Fallback: Simple plan research
+   */
+  async doSimplePlanResearch(plan, userContext) {
+    console.log(`🔍 [NightOwl] Falling back to simple plan research`);
+
+    const userPrefs = this.buildUserPreferencesContext(userContext);
+
+    const response = await this.anthropic.messages.create({
+      model: 'claude-sonnet-4-20250514',
+      max_tokens: 2000,
+      tools: [{ type: 'web_search_20250305' }],
+      messages: [{
+        role: 'user',
+        content: `Research and create a plan for: ${plan.title}
+${plan.description ? `Details: ${plan.description}` : ''}
+
+User context:
+${userPrefs}
+
+Provide practical, actionable recommendations.`
+      }],
+      system: 'Create a helpful, personalized plan based on research. Use web search for current information.'
+    });
+
+    const { text, sources } = this.extractResponseContent(response);
+
+    return {
+      id: this.generateId('plan_insight'),
+      loopId: plan.id,
+      loopTitle: plan.title,
+      insightType: 'plan_research',
+      content: text,
+      conversationHook: await this.generatePlanConversationHook(plan, 'research', text),
+      sources,
+      createdAt: Date.now(),
+      status: 'pending'
+    };
+  }
+
+  /**
+   * Refine a plan - now uses iterative approach to make it more concrete
+   */
+  async refinePlan(plan, userContext) {
+    console.log(`🎨 [NightOwl] Refining plan iteratively: "${plan.title}"`);
+
+    try {
+      // Discover context
+      const userDiscovery = await this.discoverRelevantUserContext(plan, userContext);
+
+      // Analyze current plan state
       const response = await this.anthropic.messages.create({
         model: 'claude-sonnet-4-20250514',
-        max_tokens: 1500,
-        tools: [{ type: 'web_search_20250305' }],
-        messages: [{ role: 'user', content: userPrompt }],
-        system: systemPrompt
+        max_tokens: 1000,
+        messages: [{
+          role: 'user',
+          content: `Analyze this plan and identify what needs refinement.
+
+PLAN: ${plan.title}
+${plan.description ? `CURRENT STATE: ${plan.description}` : 'No details yet'}
+
+USER CONTEXT:
+${userDiscovery.summary}
+Constraints: ${userDiscovery.knownConstraints.join(', ') || 'none'}
+Preferences: ${userDiscovery.knownPreferences.join(', ') || 'none'}
+
+What aspects of this plan are:
+1. Too vague and need specifics?
+2. Missing important considerations?
+3. Not aligned with their constraints/preferences?
+4. Lacking concrete next steps?
+
+Respond in JSON:
+{
+  "vagueAreas": ["area1", "area2"],
+  "missingConsiderations": ["consideration1"],
+  "alignmentIssues": ["issue1"],
+  "refinementQuestions": ["specific question to research to refine this"],
+  "assessment": "overall assessment"
+}`
+        }],
+        system: 'Analyze a plan to identify refinement needs. Respond only with valid JSON.'
       });
 
-      const { text, sources } = this.extractResponseContent(response);
+      let refinementNeeds;
+      try {
+        const text = response.content[0]?.text || '';
+        const jsonMatch = text.match(/\{[\s\S]*\}/);
+        refinementNeeds = jsonMatch ? JSON.parse(jsonMatch[0]) : null;
+      } catch (e) {
+        refinementNeeds = null;
+      }
+
+      // Research refinements if needed
+      const findings = [];
+      if (refinementNeeds?.refinementQuestions?.length > 0) {
+        const researchFindings = await this.executeResearchIteration(
+          refinementNeeds.refinementQuestions.slice(0, 3),
+          plan,
+          this.buildUserPreferencesContext(userContext),
+          3
+        );
+        findings.push(...researchFindings);
+      }
+
+      // Generate refined plan
+      const refinedPlan = await this.anthropic.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 2000,
+        messages: [{
+          role: 'user',
+          content: `Refine this plan to be more specific and actionable.
+
+ORIGINAL PLAN: ${plan.title}
+${plan.description ? `CURRENT STATE: ${plan.description}` : ''}
+
+REFINEMENT ANALYSIS:
+${refinementNeeds ? JSON.stringify(refinementNeeds, null, 2) : 'No specific analysis'}
+
+ADDITIONAL RESEARCH:
+${findings.map(f => `Q: ${f.question}\nA: ${f.answer}`).join('\n\n') || 'None'}
+
+USER CONTEXT:
+${userDiscovery.summary}
+Constraints: ${userDiscovery.knownConstraints.join(', ') || 'none'}  
+Preferences: ${userDiscovery.knownPreferences.join(', ') || 'none'}
+
+Create a refined version that:
+1. Makes vague areas specific
+2. Addresses missing considerations
+3. Aligns with their constraints and preferences
+4. Has clear, concrete next steps with timelines
+5. Builds in checkpoints or accountability
+
+Be conversational - this goes in chat.`
+        }],
+        system: 'Refine plans to be specific and actionable. Every step should be concrete enough to act on.'
+      });
+
+      const sources = [...new Set(findings.flatMap(f => f.sources || []))];
 
       return {
         id: this.generateId('plan_insight'),
         loopId: plan.id,
         loopTitle: plan.title,
         insightType: 'plan_refinement',
-        content: text,
-        conversationHook: await this.generatePlanConversationHook(plan, 'refine', text),
+        content: refinedPlan.content[0]?.text?.trim(),
+        conversationHook: await this.generatePlanConversationHook(plan, 'refine', refinedPlan.content[0]?.text),
         sources,
         createdAt: Date.now(),
         status: 'pending'
@@ -2321,60 +3285,129 @@ Make the plan more strategic and actionable.`;
     }
   }
 
+  /**
+   * Unblock a stalled plan - diagnose why it's stuck and find solutions
+   */
   async unblockPlan(plan, userContext) {
     console.log(`🔓 [NightOwl] Unblocking plan: "${plan.title}"`);
 
     const daysSinceUpdate = Math.floor((Date.now() - (plan.updatedAt || plan.createdAt)) / (24 * 60 * 60 * 1000));
 
-    const systemPrompt = `You are a strategic advisor helping someone identify and overcome what's blocking their progress on a plan.
+    try {
+      // Discover user context including patterns
+      const userDiscovery = await this.discoverRelevantUserContext(plan, userContext);
 
-Your analysis should:
-- Identify likely reasons for the stall (psychological, practical, resource, clarity)
-- Suggest specific ways to overcome these blocks
-- Provide alternative approaches that might work better
-- Help them rebuild momentum
-- Be encouraging while being realistic about challenges
-
-Focus on actionable solutions to get them unstuck.`;
-
-    const userPrompt = `This plan has been stalled for ${daysSinceUpdate} days:
+      // Diagnose the block
+      const diagnosisResponse = await this.anthropic.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1000,
+        messages: [{
+          role: 'user',
+          content: `Diagnose why this plan has stalled.
 
 PLAN: ${plan.title}
-${plan.description ? `Details: ${plan.description}` : ''}
+${plan.description ? `DETAILS: ${plan.description}` : ''}
+STALLED FOR: ${daysSinceUpdate} days
 
-USER CONTEXT:
-${this.buildUserPreferencesContext(userContext)}
+USER PATTERNS:
+${userDiscovery.relevantPatterns.map(p => `- ${p}`).join('\n') || '- No patterns identified'}
 
-THEIR PATTERNS:
-${this.buildPatternsContext(userContext)}
+USER CONSTRAINTS:
+${userDiscovery.knownConstraints.map(c => `- ${c}`).join('\n') || '- None identified'}
 
-Please analyze:
-1. What's likely blocking progress (be specific)
-2. Strategies to overcome these specific blocks
-3. Alternative approaches that might work better
-4. Small, concrete steps to rebuild momentum
-5. How to prevent future stalls on this plan
+Common reasons plans stall:
+- Too vague / unclear next step
+- Overwhelm / too big
+- Missing resource or information
+- Competing priorities
+- Psychological resistance (fear, perfectionism)
+- External blocker
+- Lost motivation / forgot why it matters
 
-Help them get unstuck and move forward.`;
+What's most likely blocking THIS plan for THIS person?
 
-    try {
-      const response = await this.anthropic.messages.create({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1500,
-        messages: [{ role: 'user', content: userPrompt }],
-        system: systemPrompt
+Respond in JSON:
+{
+  "likelyBlockers": [
+    {"blocker": "description", "likelihood": "high/medium/low", "evidence": "why you think this"}
+  ],
+  "questionsToResearch": ["specific question that might help unblock"],
+  "quickWins": ["small action that could rebuild momentum"],
+  "assessment": "overall diagnosis"
+}`
+        }],
+        system: 'Diagnose why plans stall. Consider both practical and psychological factors. Respond only with valid JSON.'
       });
 
-      const { text } = this.extractResponseContent(response);
+      let diagnosis;
+      try {
+        const text = diagnosisResponse.content[0]?.text || '';
+        const jsonMatch = text.match(/\{[\s\S]*\}/);
+        diagnosis = jsonMatch ? JSON.parse(jsonMatch[0]) : null;
+      } catch (e) {
+        diagnosis = null;
+      }
+
+      // Research solutions for the blockers
+      const findings = [];
+      if (diagnosis?.questionsToResearch?.length > 0) {
+        const researchFindings = await this.executeResearchIteration(
+          diagnosis.questionsToResearch.slice(0, 2),
+          plan,
+          this.buildUserPreferencesContext(userContext),
+          2
+        );
+        findings.push(...researchFindings);
+      }
+
+      // Generate unblock strategy
+      const unblockResponse = await this.anthropic.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1500,
+        messages: [{
+          role: 'user',
+          content: `Create a strategy to unblock this stalled plan.
+
+PLAN: ${plan.title}
+STALLED FOR: ${daysSinceUpdate} days
+
+DIAGNOSIS:
+${diagnosis ? JSON.stringify(diagnosis, null, 2) : 'Could not diagnose'}
+
+RESEARCH ON SOLUTIONS:
+${findings.map(f => `Q: ${f.question}\nA: ${f.answer}`).join('\n\n') || 'None'}
+
+USER CONTEXT:
+${userDiscovery.summary}
+Their patterns: ${userDiscovery.relevantPatterns.join(', ') || 'none identified'}
+
+Create an unblocking strategy that:
+1. Acknowledges what's likely really going on (empathetically)
+2. Addresses the specific blockers identified
+3. Provides ONE clear, small next step they can take TODAY
+4. Rebuilds momentum gradually
+5. Accounts for their patterns (to prevent re-stalling)
+6. Reframes or reconnects to why this matters
+
+Be warm and encouraging, not preachy. This goes in chat.`
+        }],
+        system: 'Help people get unstuck on stalled plans. Be empathetic and practical. Small steps matter.'
+      });
+
+      const sources = [...new Set(findings.flatMap(f => f.sources || []))];
 
       return {
         id: this.generateId('plan_insight'),
         loopId: plan.id,
         loopTitle: plan.title,
         insightType: 'plan_unblock',
-        content: text,
-        conversationHook: await this.generatePlanConversationHook(plan, 'blocked', text),
-        sources: [],
+        content: unblockResponse.content[0]?.text?.trim(),
+        conversationHook: await this.generatePlanConversationHook(plan, 'blocked', unblockResponse.content[0]?.text),
+        sources,
+        metadata: {
+          daysSinceUpdate,
+          diagnosis: diagnosis?.assessment
+        },
         createdAt: Date.now(),
         status: 'pending'
       };
@@ -2385,56 +3418,72 @@ Help them get unstuck and move forward.`;
     }
   }
 
+  /**
+   * Break down a vague plan into concrete steps
+   */
   async breakdownPlan(plan, userContext) {
     console.log(`📋 [NightOwl] Breaking down plan: "${plan.title}"`);
 
-    const systemPrompt = `You are a strategic advisor helping someone break down a vague plan into specific, actionable steps.
+    try {
+      // Discover context
+      const userDiscovery = await this.discoverRelevantUserContext(plan, userContext);
 
-Your breakdown should:
-- Turn the broad plan into concrete, manageable tasks
-- Organize steps in a logical sequence
-- Identify dependencies and prerequisites
-- Make each step specific enough that they'll know exactly what to do
-- Include rough time estimates where helpful
+      // Research how to approach this type of goal
+      const approachFindings = await this.executeResearchIteration(
+        [
+          `Step by step guide to ${plan.title}`,
+          `Common mistakes when trying to ${plan.title}`,
+          `How long does it take to ${plan.title}`
+        ],
+        plan,
+        this.buildUserPreferencesContext(userContext),
+        3
+      );
 
-Focus on making the abstract concrete and actionable.`;
+      // Generate breakdown
+      const breakdownResponse = await this.anthropic.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 2000,
+        messages: [{
+          role: 'user',
+          content: `Break down this goal into a concrete, actionable plan.
 
-    const userPrompt = `This plan needs to be broken down into actionable steps:
+GOAL: ${plan.title}
+${plan.description ? `CONTEXT: ${plan.description}` : ''}
 
-PLAN: ${plan.title}
-${plan.description ? `Current description: ${plan.description}` : ''}
+RESEARCH ON APPROACH:
+${approachFindings.map(f => `### ${f.question}\n${f.answer}`).join('\n\n')}
 
 USER CONTEXT:
-${this.buildUserPreferencesContext(userContext)}
+${userDiscovery.summary}
+Constraints: ${userDiscovery.knownConstraints.join(', ') || 'none'}
+Preferences: ${userDiscovery.knownPreferences.join(', ') || 'none'}
+Patterns: ${userDiscovery.relevantPatterns.join(', ') || 'none'}
 
-Please provide:
-1. Specific, actionable steps to achieve this plan
-2. Logical order and dependencies between steps
-3. Prerequisites or preparation needed
-4. Rough time estimates for each major phase
-5. Early wins or quick victories they could pursue
-6. How to track progress along the way
+Create a breakdown that:
+1. Starts with a single "first step" they can do in under 15 minutes
+2. Organizes steps into phases (e.g., Week 1-2, Week 3-4)
+3. Makes each step specific enough to act on without thinking
+4. Includes how to know when each step is "done"
+5. Builds in early wins to create momentum
+6. Accounts for their patterns and constraints
+7. Flags decision points where they'll need to choose a path
+8. Estimates realistic timeframes
 
-Transform this from a vague plan into a clear roadmap.`;
-
-    try {
-      const response = await this.anthropic.messages.create({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 1500,
-        tools: [{ type: 'web_search_20250305' }],
-        messages: [{ role: 'user', content: userPrompt }],
-        system: systemPrompt
+Be conversational - this goes in chat. Make it feel achievable, not overwhelming.`
+        }],
+        system: 'Break down goals into concrete, actionable steps. Make it feel achievable. First steps should be tiny.'
       });
 
-      const { text, sources } = this.extractResponseContent(response);
+      const sources = [...new Set(approachFindings.flatMap(f => f.sources || []))];
 
       return {
         id: this.generateId('plan_insight'),
         loopId: plan.id,
         loopTitle: plan.title,
         insightType: 'plan_breakdown',
-        content: text,
-        conversationHook: await this.generatePlanConversationHook(plan, 'breakdown', text),
+        content: breakdownResponse.content[0]?.text?.trim(),
+        conversationHook: await this.generatePlanConversationHook(plan, 'breakdown', breakdownResponse.content[0]?.text),
         sources,
         createdAt: Date.now(),
         status: 'pending'
@@ -2446,62 +3495,69 @@ Transform this from a vague plan into a clear roadmap.`;
     }
   }
 
+  /**
+   * General plan analysis - provides strategic insight
+   */
   async generalPlanAnalysis(plan, userContext) {
-    console.log(`🤔 [NightOwl] General analysis of plan: "${plan.title}"`);
-
-    const systemPrompt = `You are a thoughtful advisor providing strategic insight on someone's plan.
-
-Your analysis should:
-- Offer a fresh perspective or angle they might not have considered
-- Identify opportunities and potential challenges
-- Suggest improvements or optimizations
-- Connect the plan to their broader context and goals
-- Be practical and actionable
-
-Provide value through insight and strategic thinking.`;
-
-    const userPrompt = `Provide strategic insight on this plan:
-
-PLAN: ${plan.title}
-${plan.description ? `Details: ${plan.description}` : ''}
-
-USER CONTEXT:
-${this.buildUserPreferencesContext(userContext)}
-
-Please offer:
-1. Strategic perspective on this plan
-2. Opportunities they might not have considered
-3. Potential challenges to anticipate
-4. Ways to improve or optimize their approach
-5. How this connects to their broader goals
-6. Specific next actions they should consider
-
-Give them valuable strategic insight.`;
+    console.log(`🤔 [NightOwl] Analyzing plan: "${plan.title}"`);
 
     try {
-      const response = await this.anthropic.messages.create({
+      const userDiscovery = await this.discoverRelevantUserContext(plan, userContext);
+
+      // Research relevant strategic considerations
+      const findings = await this.executeResearchIteration(
+        [`Best practices for ${plan.title}`, `What to consider when ${plan.title}`],
+        plan,
+        this.buildUserPreferencesContext(userContext),
+        2
+      );
+
+      const analysisResponse = await this.anthropic.messages.create({
         model: 'claude-sonnet-4-20250514',
-        max_tokens: 1000,
-        messages: [{ role: 'user', content: userPrompt }],
-        system: systemPrompt
+        max_tokens: 1500,
+        messages: [{
+          role: 'user',
+          content: `Provide strategic insight on this plan.
+
+PLAN: ${plan.title}
+${plan.description ? `DETAILS: ${plan.description}` : ''}
+
+RESEARCH:
+${findings.map(f => `### ${f.question}\n${f.answer}`).join('\n\n')}
+
+USER CONTEXT:
+${userDiscovery.summary}
+Constraints: ${userDiscovery.knownConstraints.join(', ') || 'none'}
+Patterns: ${userDiscovery.relevantPatterns.join(', ') || 'none'}
+
+Provide strategic analysis:
+1. What's the most important thing to get right?
+2. What's a non-obvious approach they should consider?
+3. What pitfalls should they watch for given their patterns?
+4. How does this connect to their broader life/goals?
+5. What would make this 10x more likely to succeed?
+
+Be insightful, not generic. This goes in chat.`
+        }],
+        system: 'Provide strategic insight on plans. Go beyond obvious advice. Be specific to their situation.'
       });
 
-      const { text } = this.extractResponseContent(response);
+      const sources = [...new Set(findings.flatMap(f => f.sources || []))];
 
       return {
         id: this.generateId('plan_insight'),
         loopId: plan.id,
         loopTitle: plan.title,
         insightType: 'plan_analysis',
-        content: text,
-        conversationHook: await this.generatePlanConversationHook(plan, 'analysis', text),
-        sources: [],
+        content: analysisResponse.content[0]?.text?.trim(),
+        conversationHook: await this.generatePlanConversationHook(plan, 'analysis', analysisResponse.content[0]?.text),
+        sources,
         createdAt: Date.now(),
         status: 'pending'
       };
 
     } catch (error) {
-      console.error(`❌ [NightOwl] General plan analysis failed:`, error.message);
+      console.error(`❌ [NightOwl] Plan analysis failed:`, error.message);
       return null;
     }
   }
@@ -2808,6 +3864,29 @@ Return ONLY the opener, nothing else.`
       }
     } catch (error) {
       console.error(`❌ [NightOwl] Failed to dismiss insight:`, error.message);
+    }
+  }
+
+  /**
+   * Clear all insights (pending, delivered, dismissed)
+   */
+  async clearAllInsights() {
+    try {
+      const files = await this.crsService.listFiles('system/nightowl');
+      let deleted = 0;
+
+      for (const file of files) {
+        if (file.name.startsWith('insight_') && file.name.endsWith('.json')) {
+          await this.crsService.deleteFile(`system/nightowl/${file.name}`);
+          deleted++;
+        }
+      }
+
+      console.log(`🦉 [NightOwl] Cleared ${deleted} insights`);
+      return { success: true, deleted };
+    } catch (error) {
+      console.error(`❌ [NightOwl] Failed to clear insights:`, error.message);
+      return { success: false, error: error.message };
     }
   }
 
