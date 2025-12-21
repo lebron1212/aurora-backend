@@ -830,6 +830,64 @@ app.post('/nightowl/context/clear', async (req, res) => {
 });
 
 // ============================================================================
+// NIGHT OWL SETTINGS ENDPOINTS
+// ============================================================================
+
+// Get Night Owl settings
+app.get('/nightowl/settings', async (req, res) => {
+  try {
+    await nightOwl.initialize();
+    const settings = nightOwl.settings;
+    res.json({ settings });
+  } catch (error) {
+    console.error('❌ [NIGHT OWL] Failed to get settings:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update Night Owl settings (persists to system/nightowl/settings.json)
+app.post('/nightowl/settings', async (req, res) => {
+  try {
+    const { settings } = req.body;
+    const updated = await nightOwl.saveSettings(settings);
+    console.log('🦉 [NIGHT OWL] Settings updated:', JSON.stringify(updated));
+    res.json({ settings: updated });
+  } catch (error) {
+    console.error('❌ [NIGHT OWL] Failed to save settings:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================================
+// NIGHT OWL QUEUE ENDPOINTS
+// ============================================================================
+
+// Get queue status (includes pending requests, completed, and settings)
+app.get('/nightowl/queue/status', async (req, res) => {
+  try {
+    await nightOwl.initialize();
+    const status = await nightOwl.getQueueStatus();
+    res.json(status);
+  } catch (error) {
+    console.error('❌ [NIGHT OWL] Failed to get queue status:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Queue a request for Night Owl processing
+app.post('/nightowl/queue', async (req, res) => {
+  try {
+    const { request } = req.body;
+    const queued = await nightOwl.queueRequest(request);
+    console.log('🦉 [NIGHT OWL] Request queued:', queued.id);
+    res.json({ request: queued });
+  } catch (error) {
+    console.error('❌ [NIGHT OWL] Failed to queue request:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================================
 // EXISTING NOTIFICATION ENDPOINTS
 // ============================================================================
 

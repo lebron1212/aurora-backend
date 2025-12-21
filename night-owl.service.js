@@ -76,6 +76,17 @@ import Anthropic from '@anthropic-ai/sdk';
  * @property {string[]} sources - URLs if web research was used
  * @property {number} createdAt
  * @property {string} status - pending|delivered|dismissed
+ * @property {StagedAction[]} [stagedActions] - Suggested actions for main service to execute
+ */
+
+/**
+ * @typedef {Object} StagedAction
+ * @property {string} id
+ * @property {'create_note'|'add_calendar_event'|'update_loop'|'resolve_loop'|'create_loop'|'add_fact'} type
+ * @property {Object} payload - Data needed to execute the action
+ * @property {string} description - Human-readable description of what this action does
+ * @property {boolean} requiresApproval - If true, user must explicitly approve
+ * @property {'pending'|'approved'|'executed'|'rejected'} status
  */
 
 /**
@@ -645,6 +656,24 @@ class NightOwlService {
    * Process a single queued request
    */
   async processQueuedRequest(request, userContext, healthData, trackingData) {
+
+    // For research requests, use the iterative research system with depth
+    if (request.type === 'research') {
+      const depth = request.depth || 'standard';
+      console.log(`🔬 [NightOwl] Using ${depth} research depth for: "${request.request}"`);
+      
+      // Create a pseudo-loop for the research system
+      const researchLoop = {
+        id: request.id,
+        title: request.request,
+        description: request.context || '',
+        loopType: 'research',
+        priority: request.priority === 'high' ? 1 : request.priority === 'low' ? 3 : 2,
+        relatedEntityIds: []
+      };
+      
+      return await this.doResearch(researchLoop, userContext, depth);
+    }
 
     // Build data context based on requested sources
     const dataContext = this.buildDataContext(request.dataSources || ['all'], {
@@ -1234,13 +1263,43 @@ Reply with ONLY the category name, nothing else.`
   /**
    * Main entry point for research -  iterative
    */
-  async doResearch(loop, userContext) {
-    console.log(`🔍 [NightOwl] Starting iterative research: "${loop.title}"`);
-
-    const config = {
+  /**
+   * Research depth configurations
+   * - quick: Fast surface-level research (~30s, ~$0.10)
+   * - standard: Balanced depth and speed (~2min, ~$0.30)  
+   * - deep: Thorough multi-iteration research (~10min, ~$1.50)
+   */
+  static RESEARCH_DEPTH_CONFIGS = {
+    quick: {
+      maxIterations: 1,
+      maxSubQuestions: 3,
+      maxSearchesPerIteration: 2,
+      synthesisDepth: 'brief'
+    },
+    standard: {
       maxIterations: 3,
       maxSubQuestions: 5,
-      maxSearchesPerIteration: 3
+      maxSearchesPerIteration: 3,
+      synthesisDepth: 'thorough'
+    },
+    deep: {
+      maxIterations: 8,
+      maxSubQuestions: 8,
+      maxSearchesPerIteration: 5,
+      synthesisDepth: 'comprehensive',
+      enableRecursiveSubtopics: true,
+      minCompletenessThreshold: 0.9
+    }
+  };
+
+  async doResearch(loop, userContext, depth = 'standard') {
+    const depthConfig = NightOwlService.RESEARCH_DEPTH_CONFIGS[depth] || NightOwlService.RESEARCH_DEPTH_CONFIGS.standard;
+    console.log(`🔍 [NightOwl] Starting ${depth} research: "${loop.title}" (max ${depthConfig.maxIterations} iterations)`);
+
+    const config = {
+      maxIterations: depthConfig.maxIterations,
+      maxSubQuestions: depthConfig.maxSubQuestions,
+      maxSearchesPerIteration: depthConfig.maxSearchesPerIteration
     };
 
     try {
@@ -1280,11 +1339,13 @@ Reply with ONLY the category name, nothing else.`
 
         // Evaluate gaps and determine if we need another iteration
         if (iteration < config.maxIterations) {
+          const completenessThreshold = depthConfig.minCompletenessThreshold || 0.8;
           const gaps = await this.evaluateResearchGaps(
             loop,
             allFindings,
             researchPlan.successCriteria,
-            userPrefs
+            userPrefs,
+            completenessThreshold
           );
 
           if (gaps.length === 0) {
@@ -1310,6 +1371,10 @@ Reply with ONLY the category name, nothing else.`
       // Collect all sources
       const allSources = [...new Set(allFindings.flatMap(f => f.sources || []))];
 
+      // PHASE 5: Generate staged actions
+      console.log(`📝 [NightOwl] Generating staged actions...`);
+      const stagedActions = await this.generateStagedActionsForResearch(loop, synthesis, allFindings);
+
       return {
         id: this.generateId('insight'),
         loopId: loop.id,
@@ -1318,8 +1383,11 @@ Reply with ONLY the category name, nothing else.`
         content: synthesis,
         conversationHook: this.generateConversationHook(loop, 'research'),
         sources: allSources,
+        stagedActions,
         metadata: {
+          depth,
           iterations: iteration,
+          maxIterations: config.maxIterations,
           subQuestionsResearched: allFindings.length,
           researchPlan: researchPlan.subQuestions
         },
@@ -1439,8 +1507,9 @@ Be specific and factual. Include numbers, names, and concrete details where avai
 
   /**
    * PHASE 3: Evaluate what's missing
+   * @param {number} completenessThreshold - Minimum completeness to stop (0.8 for standard, 0.9 for deep)
    */
-  async evaluateResearchGaps(loop, findings, successCriteria, userPrefs) {
+  async evaluateResearchGaps(loop, findings, successCriteria, userPrefs, completenessThreshold = 0.8) {
     const findingsSummary = findings.map(f =>
       `Q: ${f.question}\nA: ${f.answer.substring(0, 500)}...`
     ).join('\n\n');
@@ -1484,9 +1553,10 @@ Respond in JSON format:
       const jsonMatch = text.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
         const evaluation = JSON.parse(jsonMatch[0]);
+        console.log(`📊 [NightOwl] Research completeness: ${(evaluation.completeness * 100).toFixed(0)}% (threshold: ${(completenessThreshold * 100).toFixed(0)}%)`);
 
         // Only return gaps if completeness is below threshold
-        if (evaluation.completeness < 0.8) {
+        if (evaluation.completeness < completenessThreshold) {
           return (evaluation.gaps || [])
             .filter(g => g.importance === 'high' || g.importance === 'medium')
             .map(g => g.question);
@@ -1974,7 +2044,7 @@ Please prepare a brief context summary: who this person is, recent context, any 
 
       const { text } = this.extractResponseContent(response);
 
-      return {
+      const insight = {
         id: this.generateId('insight'),
         loopId: null,
         loopTitle: event.title,
@@ -1985,6 +2055,14 @@ Please prepare a brief context summary: who this person is, recent context, any 
         createdAt: Date.now(),
         status: 'pending'
       };
+
+      // Add staged actions for meeting prep
+      insight.stagedActions = this.generateStagedActionsForAnticipatory(insight, 'meeting', {
+        personName: personNames[0],
+        eventTitle: event.title
+      });
+
+      return insight;
     } catch (error) {
       console.error(`❌ [NightOwl] Event prep failed:`, error.message);
       return null;
@@ -2044,7 +2122,7 @@ Please suggest 2-3 thoughtful gift ideas or ways to celebrate, based on what we 
 
       const { text, sources } = this.extractResponseContent(response);
 
-      return {
+      const insight = {
         id: this.generateId('insight'),
         loopId: null,
         loopTitle: `${person.name}'s birthday`,
@@ -2055,6 +2133,14 @@ Please suggest 2-3 thoughtful gift ideas or ways to celebrate, based on what we 
         createdAt: Date.now(),
         status: 'pending'
       };
+
+      // Add staged actions for birthday
+      insight.stagedActions = this.generateStagedActionsForAnticipatory(insight, 'birthday', {
+        personName: person.name,
+        relationship: person.relationship
+      });
+
+      return insight;
     } catch (error) {
       console.error(`❌ [NightOwl] Birthday prep failed:`, error.message);
       return null;
@@ -2109,7 +2195,7 @@ Use web search for current, practical information about the destination.`
 
       const { text, sources } = this.extractResponseContent(response);
 
-      return {
+      const insight = {
         id: this.generateId('insight'),
         loopId: trip.id,
         loopTitle: trip.title,
@@ -2120,6 +2206,13 @@ Use web search for current, practical information about the destination.`
         createdAt: Date.now(),
         status: 'pending'
       };
+
+      // Add staged actions for trip prep
+      insight.stagedActions = this.generateStagedActionsForAnticipatory(insight, 'trip', {
+        destination: trip.title
+      });
+
+      return insight;
     } catch (error) {
       console.error(`❌ [NightOwl] Trip prep failed:`, error.message);
       return null;
@@ -2331,9 +2424,16 @@ ${upcoming.map(c => `- "${c.title}" (due: ${c.dueDate})`).join('\n') || 'None'}
 STALLED (no progress in 7+ days):
 ${stalledLoops.map(l => `- "${l.title}" (${Math.floor((now - (l.updatedAt || l.createdAt)) / (24 * 60 * 60 * 1000))} days)`).join('\n') || 'None'}
 
-Please provide a gentle, supportive accountability check. Not nagging - just honest and helpful. If everything looks good, say so briefly.`
+You are Ethan's RELENTLESS accountability partner. He's building toward being an Oscar-winning actor - every day matters.
+
+Give a DIRECT accountability check:
+- No sugarcoating - movie stars don't make excuses
+- Challenge any avoidance or stalling immediately
+- Remind him: "The Oscar winner version of you doesn't let things slide"
+- If training/acting work is stalled: "When are you getting this done?"
+- Keep the fire lit - that's your job`
           }],
-          system: 'You are providing a gentle accountability check. Be supportive, not judgmental. Help them see reality clearly while being kind.'
+          system: 'You are a relentless accountability partner for an aspiring Oscar-winning actor. Be direct, challenging, and keep the pressure on. No gentle coaching - hold him to the movie star standard.'
         });
 
         const { text } = this.extractResponseContent(response);
@@ -2344,7 +2444,7 @@ Please provide a gentle, supportive accountability check. Not nagging - just hon
           loopTitle: 'Accountability check',
           insightType: 'accountability',
           content: text,
-          conversationHook: `Quick check-in on some things you've got going...`,
+          conversationHook: `Progress check. Show me where you're at.`,
           sources: [],
           createdAt: Date.now(),
           status: 'pending'
@@ -2852,6 +2952,10 @@ Reply with ONLY the option name.`
       // Collect sources
       const allSources = [...new Set(allFindings.flatMap(f => f.sources || []))];
 
+      // PHASE 5: Generate staged actions for user approval
+      console.log(`🔎 [NightOwl] Phase 5: Generating staged actions...`);
+      const stagedActions = await this.generateStagedActionsForPlan(plan, filteredPlan, allFindings);
+
       return {
         id: this.generateId('plan_insight'),
         loopId: plan.id,
@@ -2860,6 +2964,7 @@ Reply with ONLY the option name.`
         content: filteredPlan,
         conversationHook: await this.generatePlanConversationHook(plan, 'research', filteredPlan),
         sources: allSources,
+        stagedActions,
         metadata: {
           iterations: iteration,
           questionsResearched: allFindings.length,
@@ -3832,7 +3937,8 @@ Return ONLY the opener, nothing else.`
         }
       }
 
-      return insights.sort((a, b) => a.createdAt - b.createdAt);
+      // Sort by createdAt DESCENDING - newest first (most relevant for immediate processing)
+      return insights.sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
     } catch (error) {
       console.error(`❌ [NightOwl] Failed to get pending insights:`, error.message);
       return [];
@@ -3888,6 +3994,309 @@ Return ONLY the opener, nothing else.`
       console.error(`❌ [NightOwl] Failed to clear insights:`, error.message);
       return { success: false, error: error.message };
     }
+  }
+
+  // ============================================================================
+  // STAGED ACTION GENERATION
+  // ============================================================================
+
+  /**
+   * Generate staged actions based on plan research
+   * These are suggestions that the main service can execute when user approves
+   */
+  async generateStagedActionsForPlan(plan, researchContent, findings) {
+    const actions = [];
+
+    try {
+      const response = await this.anthropic.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1000,
+        messages: [{
+          role: 'user',
+          content: `Based on this research for "${plan.title}", what concrete actions could be staged for the user to approve?
+
+RESEARCH SUMMARY:
+${researchContent.substring(0, 2000)}
+
+Possible action types:
+- create_note: Save this research as a note
+- update_loop: Update the plan with new details/steps
+- create_loop: Create new sub-tasks or related loops
+- add_calendar_event: Schedule something (if timing was discussed)
+
+Return JSON array of suggested actions:
+[
+  {
+    "type": "create_note",
+    "description": "Save Alaska trip research as a note",
+    "payload": { "title": "Alaska Trip Research", "content": "..." }
+  },
+  {
+    "type": "update_loop",
+    "description": "Add researched steps to the plan",
+    "payload": { "loopId": "${plan.id}", "updates": { "description": "..." } }
+  }
+]
+
+Only suggest actions that make sense. Return empty array [] if no actions are warranted.
+Return ONLY the JSON array, nothing else.`
+        }],
+        system: 'Generate staged actions for user approval. Return only valid JSON array.'
+      });
+
+      const text = response.content[0]?.text || '[]';
+      const jsonMatch = text.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        const parsed = JSON.parse(jsonMatch[0]);
+        for (const action of parsed) {
+          actions.push({
+            id: this.generateId('action'),
+            type: action.type,
+            description: action.description,
+            payload: action.payload,
+            requiresApproval: true,
+            status: 'pending'
+          });
+        }
+      }
+    } catch (error) {
+      console.warn('⚠️ [NightOwl] Failed to generate staged actions:', error.message);
+    }
+
+    // Always offer to save research as a note if we have content
+    if (actions.length === 0 && researchContent) {
+      actions.push({
+        id: this.generateId('action'),
+        type: 'create_note',
+        description: `Save "${plan.title}" research as a note`,
+        payload: {
+          title: `Research: ${plan.title}`,
+          content: researchContent,
+          tags: ['night-owl', 'research'],
+          sourceLoopId: plan.id
+        },
+        requiresApproval: true,
+        status: 'pending'
+      });
+    }
+
+    return actions;
+  }
+
+  /**
+   * Generate staged actions for research insights (non-plan loops)
+   */
+  async generateStagedActionsForResearch(loop, researchContent, findings) {
+    const actions = [];
+
+    try {
+      const response = await this.anthropic.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 800,
+        messages: [{
+          role: 'user',
+          content: `Based on this research for "${loop.title}", what concrete actions could be staged?
+
+RESEARCH SUMMARY:
+${researchContent.substring(0, 1500)}
+
+LOOP TYPE: ${loop.loopType || 'general'}
+
+Possible action types:
+- create_note: Save this research as a note
+- resolve_loop: Mark this loop as resolved (if research answers the question)
+- create_loop: Create follow-up tasks
+- add_fact: Record an important fact learned
+
+Return JSON array of suggested actions (max 3):
+[
+  {
+    "type": "create_note",
+    "description": "Brief description",
+    "payload": { ... }
+  }
+]
+
+Only suggest what makes sense. Return [] if nothing is warranted.
+Return ONLY the JSON array.`
+        }],
+        system: 'Generate staged actions for user approval. Return only valid JSON array.'
+      });
+
+      const text = response.content[0]?.text || '[]';
+      const jsonMatch = text.match(/\[[\s\S]*\]/);
+      if (jsonMatch) {
+        const parsed = JSON.parse(jsonMatch[0]);
+        for (const action of parsed.slice(0, 3)) { // Max 3 actions
+          actions.push({
+            id: this.generateId('action'),
+            type: action.type,
+            description: action.description,
+            payload: action.payload || {},
+            requiresApproval: true,
+            status: 'pending'
+          });
+        }
+      }
+    } catch (error) {
+      console.warn('⚠️ [NightOwl] Failed to generate research staged actions:', error.message);
+    }
+
+    // Default: offer to save as note
+    if (actions.length === 0 && researchContent) {
+      actions.push({
+        id: this.generateId('action'),
+        type: 'create_note',
+        description: `Save "${loop.title}" research as a note`,
+        payload: {
+          title: `Research: ${loop.title}`,
+          content: researchContent,
+          tags: ['night-owl', 'research'],
+          sourceLoopId: loop.id
+        },
+        requiresApproval: true,
+        status: 'pending'
+      });
+    }
+
+    return actions;
+  }
+
+  /**
+   * Generate staged actions for anticipatory prep (birthdays, trips, meetings)
+   */
+  generateStagedActionsForAnticipatory(insight, eventType, eventDetails = {}) {
+    const actions = [];
+
+    switch (eventType) {
+      case 'birthday':
+        actions.push({
+          id: this.generateId('action'),
+          type: 'create_loop',
+          description: `Create reminder to buy gift for ${eventDetails.personName || 'them'}`,
+          payload: {
+            title: `Buy gift for ${eventDetails.personName || insight.loopTitle}`,
+            loopType: 'task',
+            priority: 2,
+            description: insight.content,
+            dueDate: eventDetails.date
+          },
+          requiresApproval: true,
+          status: 'pending'
+        });
+        break;
+
+      case 'trip':
+        actions.push({
+          id: this.generateId('action'),
+          type: 'create_note',
+          description: 'Save packing list and trip prep notes',
+          payload: {
+            title: `Trip Prep: ${eventDetails.destination || insight.loopTitle}`,
+            content: insight.content,
+            tags: ['trip', 'planning', 'night-owl']
+          },
+          requiresApproval: true,
+          status: 'pending'
+        });
+
+        // Also suggest creating a trip prep task
+        if (eventDetails.date) {
+          const prepDate = new Date(eventDetails.date);
+          prepDate.setDate(prepDate.getDate() - 3); // 3 days before
+          actions.push({
+            id: this.generateId('action'),
+            type: 'create_loop',
+            description: 'Create trip preparation reminder',
+            payload: {
+              title: `Pack for ${eventDetails.destination || 'trip'}`,
+              loopType: 'task',
+              priority: 2,
+              dueDate: prepDate.toISOString()
+            },
+            requiresApproval: true,
+            status: 'pending'
+          });
+        }
+        break;
+
+      case 'meeting':
+        actions.push({
+          id: this.generateId('action'),
+          type: 'create_note',
+          description: `Save meeting prep notes for ${eventDetails.personName || 'meeting'}`,
+          payload: {
+            title: `Meeting Prep: ${eventDetails.personName || insight.loopTitle}`,
+            content: insight.content,
+            tags: ['meeting', 'prep', 'night-owl']
+          },
+          requiresApproval: true,
+          status: 'pending'
+        });
+        break;
+
+      default:
+        // Generic: just offer to save as note
+        if (insight.content) {
+          actions.push({
+            id: this.generateId('action'),
+            type: 'create_note',
+            description: `Save insight as a note`,
+            payload: {
+              title: insight.loopTitle || 'Night Owl Insight',
+              content: insight.content,
+              tags: ['night-owl', 'insight']
+            },
+            requiresApproval: true,
+            status: 'pending'
+          });
+        }
+    }
+
+    return actions;
+  }
+
+  /**
+   * Generate staged actions for pattern insights
+   */
+  generateStagedActionsForPattern(insight, patternType) {
+    const actions = [];
+
+    // Patterns are informational - main action is to record as a fact
+    actions.push({
+      id: this.generateId('action'),
+      type: 'add_fact',
+      description: `Record this pattern as a personal insight`,
+      payload: {
+        category: 'pattern',
+        content: `${insight.title || 'Pattern'}: ${insight.content?.substring(0, 200)}...`,
+        source: 'night-owl',
+        domain: patternType || 'behavioral'
+      },
+      requiresApproval: true,
+      status: 'pending'
+    });
+
+    // If the pattern suggests action, create a loop
+    if (insight.content?.toLowerCase().includes('consider') || 
+        insight.content?.toLowerCase().includes('try') ||
+        insight.content?.toLowerCase().includes('might help')) {
+      actions.push({
+        id: this.generateId('action'),
+        type: 'create_loop',
+        description: 'Create a follow-up to act on this pattern',
+        payload: {
+          title: `Follow up: ${insight.title || 'Pattern insight'}`,
+          loopType: 'follow_up',
+          priority: 3,
+          description: `Based on Night Owl pattern analysis: ${insight.content?.substring(0, 300)}`
+        },
+        requiresApproval: true,
+        status: 'pending'
+      });
+    }
+
+    return actions;
   }
 
   // ============================================================================

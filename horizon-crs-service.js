@@ -379,8 +379,8 @@ class HorizonCRSService {
     // Process each type
     let entities = await this.processEntities(journalText, rawData.existing.entities);
     let facts = await this.processFacts(journalText, entities, rawData.existing.facts);
-    let loops = await this.processOpenLoops(journalText, entities, rawData.existing.loops);
-
+    let loops = await this.processOpenLoops(journalText, entities, facts, rawData.existing.loops);
+    
     // Promote repeated facts to loops
     const promotedLoops = await this.promoteFactsToLoops(facts, entities, loops);
     if (promotedLoops.length > 0) {
@@ -2283,7 +2283,7 @@ For each NEW narrative (rare, max 1) return:
 
     // Load RECENT journal entries (last 3 days) - this is the key differentiator
     const recentJournals = await this.loadRecentJournalText(3);
-    
+
     // Get today's date info
     const today = new Date();
     const dayOfWeek = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][today.getDay()];
@@ -2350,13 +2350,13 @@ ${recentJournals || 'No recent entries found.'}
 ═══════════════════════════════════════════════════════════
 URGENT/IMMINENT (secondary context):
 ═══════════════════════════════════════════════════════════
-${urgentLoops.length > 0 
-  ? urgentLoops.map(l => `- ${l.title}${l.dueDate ? ` (${l.dueDate})` : ''}`).join('\n')
-  : 'Nothing urgent'}
+${urgentLoops.length > 0
+        ? urgentLoops.map(l => `- ${l.title}${l.dueDate ? ` (${l.dueDate})` : ''}`).join('\n')
+        : 'Nothing urgent'}
 
 ${milestoneEntities.length > 0
-  ? `UPCOMING MILESTONES:\n${milestoneEntities.map(e => `- ${e.name}: ${e.milestoneDate || 'soon'}`).join('\n')}`
-  : ''}
+        ? `UPCOMING MILESTONES:\n${milestoneEntities.map(e => `- ${e.name}: ${e.milestoneDate || 'soon'}`).join('\n')}`
+        : ''}
 
 ═══════════════════════════════════════════════════════════
 
@@ -2392,7 +2392,7 @@ If journals are empty, generate questions about what's urgent/imminent instead.`
 
       console.log(`💡 [CRS] Generated ${questions.length} journal-anchored questions`);
       questions.forEach(q => console.log(`  → "${q.text}" (anchored to: ${q.anchor})`));
-      
+
       return questions;
 
     } catch (error) {
@@ -2415,7 +2415,7 @@ If journals are empty, generate questions about what's urgent/imminent instead.`
         const date = new Date(today);
         date.setDate(date.getDate() - i);
         const dateStr = date.toISOString().split('T')[0];
-        
+
         const dayEntries = journals[dateStr] || [];
         for (const entry of dayEntries) {
           const content = entry.content || entry.text || '';
@@ -2435,7 +2435,7 @@ If journals are empty, generate questions about what's urgent/imminent instead.`
       if (combined.length > 2000) {
         return combined.substring(0, 2000) + '...';
       }
-      
+
       return combined;
     } catch (error) {
       console.error('❌ [CRS] Failed to load recent journals:', error.message);
