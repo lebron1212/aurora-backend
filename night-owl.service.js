@@ -1384,6 +1384,7 @@ Reply with ONLY the category name, nothing else.`
         conversationHook: this.generateConversationHook(loop, 'research'),
         sources: allSources,
         stagedActions,
+        isQueued: true,  // Mark as user-requested, not autonomous
         metadata: {
           depth,
           iterations: iteration,
@@ -1663,6 +1664,7 @@ Please research this thoroughly and provide practical, personalized findings. Us
         content: text,
         conversationHook: this.generateConversationHook(loop, 'research'),
         sources,
+        isQueued: true,  // Mark as user-requested, not autonomous
         createdAt: Date.now(),
         status: 'pending'
       };
