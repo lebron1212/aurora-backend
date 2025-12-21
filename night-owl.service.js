@@ -3980,19 +3980,30 @@ Return ONLY the opener, nothing else.`
     try {
       const files = await this.crsService.listFiles('system/nightowl');
       let deleted = 0;
+      let failed = 0;
+
+      console.log(`🦉 [NightOwl] Found ${files.length} files in system/nightowl`);
 
       for (const file of files) {
         if (file.name.startsWith('insight_') && file.name.endsWith('.json')) {
-          await this.crsService.deleteFile(`system/nightowl/${file.name}`);
-          deleted++;
+          const filePath = `system/nightowl/${file.name}`;
+          console.log(`🦉 [NightOwl] Deleting: ${filePath}`);
+          
+          const success = await this.crsService.deleteFile(filePath);
+          if (success) {
+            deleted++;
+          } else {
+            failed++;
+            console.error(`❌ [NightOwl] Failed to delete: ${filePath}`);
+          }
         }
       }
 
-      console.log(`🦉 [NightOwl] Cleared ${deleted} insights`);
-      return { success: true, deleted };
+      console.log(`🦉 [NightOwl] Cleared ${deleted} insights (${failed} failed)`);
+      return { success: failed === 0, deleted, failed };
     } catch (error) {
       console.error(`❌ [NightOwl] Failed to clear insights:`, error.message);
-      return { success: false, error: error.message };
+      return { success: false, error: error.message, deleted: 0 };
     }
   }
 

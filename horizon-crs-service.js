@@ -2711,14 +2711,18 @@ If journals are empty, generate questions about what's urgent/imminent instead.`
 
   async deleteFile(path) {
     try {
-      const { error } = await supabase.storage
+      console.log(`🗑️ [CRS] Attempting to delete: ${path}`);
+      
+      const { error, data } = await supabase.storage
         .from('horizon-files')
         .remove([path]);
 
       if (error) {
+        console.error(`❌ [CRS] Supabase delete error for ${path}:`, error);
         throw error;
       }
 
+      console.log(`✅ [CRS] Successfully deleted: ${path}`, data);
       return true;
     } catch (error) {
       console.error(`❌ [CRS] Failed to delete file ${path}:`, error.message);
