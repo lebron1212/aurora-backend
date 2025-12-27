@@ -3,7 +3,7 @@
  * Cognitive Representation System for Aurora
  * 
  * Handles:
- * - Processing journals/conversations into entities, facts, loops, patterns, narratives
+ * - Processing journals/conversations into entities, facts, life threads, patterns, narratives
  * - Exporting CRS outputs to /system file structure in Supabase
  * - Generating update manifests for RTCS sync
  * - Nightly processing cron jobs
@@ -117,8 +117,8 @@ class HorizonCRSService {
     // Initialize Night Owl service
     this.nightOwl = new NightOwlService(this, {
       anthropicApiKey: process.env.ANTHROPIC_API_KEY,
-      maxLoopsPerRun: 3,
-      minPriority: 2
+      maxThreadsPerRun: 3,
+      minEmotionalWeight: 5
     });
   }
 
@@ -202,8 +202,8 @@ class HorizonCRSService {
       'system/entities/places',
       'system/entities/concepts',
       'system/facts',
-      'system/open_loops',
-      'system/open_loops/resolved',
+      'system/life_threads',
+      'system/life_threads/resolved',
       'system/patterns',
       'system/narratives',
       'system/updates'
@@ -259,7 +259,7 @@ class HorizonCRSService {
         const nightOwlResults = await this.nightOwl.process();
         console.log(`🦉 [CRS] Night Owl complete: ${nightOwlResults.processed} insights generated`);
         if (nightOwlResults.breakdown) {
-          console.log(`🦉 [CRS] Breakdown: loops=${nightOwlResults.breakdown.loops}, prep=${nightOwlResults.breakdown.prep}, patterns=${nightOwlResults.breakdown.patterns}, reminders=${nightOwlResults.breakdown.reminders}, accountability=${nightOwlResults.breakdown.accountability}, connections=${nightOwlResults.breakdown.connections}, health=${nightOwlResults.breakdown.health}, learning=${nightOwlResults.breakdown.learning}, plans=${nightOwlResults.breakdown.plans}`);
+          console.log(`🦉 [CRS] Breakdown: threads=${nightOwlResults.breakdown.threads}, prep=${nightOwlResults.breakdown.prep}, patterns=${nightOwlResults.breakdown.patterns}, reminders=${nightOwlResults.breakdown.reminders}, accountability=${nightOwlResults.breakdown.accountability}, connections=${nightOwlResults.breakdown.connections}, health=${nightOwlResults.breakdown.health}, learning=${nightOwlResults.breakdown.learning}, plans=${nightOwlResults.breakdown.plans}`);
         }
       } catch (nightOwlError) {
         console.error('❌ [CRS] Night Owl processing failed:', nightOwlError.message);
@@ -270,7 +270,7 @@ class HorizonCRSService {
       this.lastProcessingTime = Date.now();
 
       console.log(`✅ [CRS] Nightly processing completed in ${processingTime}ms`);
-      console.log(`📈 [CRS] Processed: ${crsOutputs.entities.length} entities, ${crsOutputs.facts.length} facts, ${crsOutputs.loops.length} loops, ${crsOutputs.patterns.length} patterns, ${crsOutputs.narratives.length} narratives`);
+      console.log(`📈 [CRS] Processed: ${crsOutputs.entities.length} entities, ${crsOutputs.facts.length} facts, ${crsOutputs.lifeThreads.length} threads, ${crsOutputs.patterns.length} patterns, ${crsOutputs.narratives.length} narratives`);
 
     } catch (error) {
       console.error('❌ [CRS] Nightly processing failed:', error);
@@ -288,7 +288,7 @@ class HorizonCRSService {
     // Load existing system files for incremental processing
     const existingEntities = await this.loadExistingSystemFiles('entities');
     const existingFacts = await this.loadExistingSystemFiles('facts');
-    const existingLoops = await this.loadExistingSystemFiles('open_loops');
+    const existingLifeThreads = await this.loadExistingSystemFiles('life_threads');
     const existingPatterns = await this.loadExistingSystemFiles('patterns');
     const existingNarratives = await this.loadExistingSystemFiles('narratives');
 
@@ -319,7 +319,7 @@ class HorizonCRSService {
     }
 
     console.log(`📥 [CRS] Loaded ${allJournals.length} journals, ${allConversations.length} conversations`);
-    console.log(`📥 [CRS] Existing: ${existingEntities.length} entities, ${existingFacts.length} facts`);
+    console.log(`📥 [CRS] Existing: ${existingEntities.length} entities, ${existingFacts.length} facts, ${existingLifeThreads.length} life threads`);
 
     return {
       journals: allJournals,
@@ -327,7 +327,7 @@ class HorizonCRSService {
       existing: {
         entities: existingEntities,
         facts: existingFacts,
-        loops: existingLoops,
+        lifeThreads: existingLifeThreads,
         patterns: existingPatterns,
         narratives: existingNarratives
       }
@@ -345,7 +345,7 @@ class HorizonCRSService {
       return {
         entities: rawData.existing.entities || [],
         facts: rawData.existing.facts || [],
-        loops: rawData.existing.loops || [],
+        lifeThreads: rawData.existing.lifeThreads || [],
         patterns: rawData.existing.patterns || [],
         narratives: rawData.existing.narratives || []
       };
@@ -370,7 +370,7 @@ class HorizonCRSService {
       return {
         entities: rawData.existing.entities || [],
         facts: rawData.existing.facts || [],
-        loops: rawData.existing.loops || [],
+        lifeThreads: rawData.existing.lifeThreads || [],
         patterns: rawData.existing.patterns || [],
         narratives: rawData.existing.narratives || []
       };
@@ -379,14 +379,10 @@ class HorizonCRSService {
     // Process each type
     let entities = await this.processEntities(journalText, rawData.existing.entities);
     let facts = await this.processFacts(journalText, entities, rawData.existing.facts);
-    let loops = await this.processOpenLoops(journalText, entities, facts, rawData.existing.loops);
     
-    // Promote repeated facts to loops
-    const promotedLoops = await this.promoteFactsToLoops(facts, entities, loops);
-    if (promotedLoops.length > 0) {
-      loops = [...loops, ...promotedLoops];
-      console.log(`⬆️ [CRS] Added ${promotedLoops.length} promoted loops`);
-    }
+    // Process LIFE THREADS (the tracking system for ongoing situations)
+    let lifeThreads = await this.processLifeThreads(journalText, entities, facts, rawData.existing.lifeThreads);
+    
     let patterns = await this.processPatterns(journalText, facts, rawData.existing.patterns);
     let narratives = await this.processNarratives(journalText, entities, facts, rawData.existing.narratives);
 
@@ -407,14 +403,8 @@ class HorizonCRSService {
     // 4. Upgrade patterns (hypothesis → confirmed after 2+ datapoints)
     patterns = this.upgradePatterns(patterns, facts);
 
-    // 5. Merge similar open loops
-    loops = this.mergeOpenLoops(loops);
-
-    // 6. Auto-close stale loops
-    loops = this.autoCloseStaleLoops(loops);
-
-    // 7. Detect and prioritize milestones
-    const milestones = await this.detectMilestones(journalText, entities, loops);
+    // 5. Detect and prioritize milestones (using life threads)
+    const milestones = await this.detectMilestones(journalText, entities, lifeThreads);
     if (milestones.length > 0) {
       console.log(`🎯 [CRS] Detected ${milestones.length} milestone signals`);
 
@@ -434,36 +424,6 @@ class HorizonCRSService {
           }
         }
 
-        // Boost loop priority to 1 (highest)
-        if (milestone.loopId) {
-          const loop = loops.find(l => l.id === milestone.loopId);
-          if (loop) {
-            loop.priority = 1;
-            loop.isMilestone = true;
-            loop.milestoneIntensity = milestone.intensity;
-            console.log(`  ⬆️ Elevated "${loop.title}" to priority 1 (milestone)`);
-          }
-        }
-
-        // If no loop exists, create one
-        if (!milestone.loopId && milestone.entityId && milestone.daysUntil) {
-          const newLoop = {
-            id: generateId('loop'),
-            title: `Milestone with ${milestone.entityName} in ${milestone.daysUntil} days`,
-            loopType: 'milestone',
-            priority: 1,
-            status: 'open',
-            isMilestone: true,
-            milestoneIntensity: milestone.intensity,
-            relatedEntityIds: [milestone.entityId],
-            dueDate: new Date(Date.now() + milestone.daysUntil * 24 * 60 * 60 * 1000).toISOString().split('T')[0],
-            createdAt: Date.now(),
-            updatedAt: Date.now()
-          };
-          loops.push(newLoop);
-          console.log(`  ✨ Created milestone loop: "${newLoop.title}"`);
-        }
-
         // Update narrative trajectory
         const narrative = narratives.find(n =>
           n.characterIds?.includes(milestone.entityId) ||
@@ -476,12 +436,56 @@ class HorizonCRSService {
             : null;
           console.log(`  📖 Updated narrative "${narrative.topic}" → approaching_milestone`);
         }
+        
+        // Update related life threads with milestone info
+        const thread = lifeThreads.find(t =>
+          t.relatedEntities?.includes(milestone.entityId) ||
+          t.title.toLowerCase().includes(milestone.entityName?.toLowerCase() || '')
+        );
+        if (thread && !thread.resolved) {
+          thread.emotionalWeight = Math.min(10, (thread.emotionalWeight || 5) + 2);
+          thread.nextMilestone = {
+            date: Date.now() + (milestone.daysUntil * 24 * 60 * 60 * 1000),
+            description: milestone.signal
+          };
+          console.log(`  🧵 Updated thread "${thread.title}" with milestone`);
+        }
+        
+        // If no thread exists for this milestone, create one
+        if (!thread && milestone.entityId && milestone.daysUntil) {
+          const newThread = {
+            id: `thread_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+            title: `${milestone.entityName} - upcoming milestone`,
+            category: 'waiting',
+            status: `${milestone.signal}`,
+            currentContext: `Milestone detected: ${milestone.signal}`,
+            emotionalWeight: Math.min(10, 5 + milestone.intensity),
+            lastUpdate: Date.now(),
+            createdAt: Date.now(),
+            updates: [{
+              timestamp: Date.now(),
+              content: `Milestone detected: ${milestone.signal}`,
+              source: 'crs'
+            }],
+            nextMilestone: {
+              date: Date.now() + (milestone.daysUntil * 24 * 60 * 60 * 1000),
+              description: milestone.signal
+            },
+            pastMilestones: [],
+            relatedEntities: [milestone.entityId],
+            relatedThreads: [],
+            userGuidance: [],
+            resolved: false
+          };
+          lifeThreads.push(newThread);
+          console.log(`  🧵 Created thread: "${newThread.title}"`);
+        }
       }
     }
 
     console.log('✨ [CRS] Post-processing refinements applied');
 
-    return { entities, facts, loops, patterns, narratives };
+    return { entities, facts, lifeThreads, patterns, narratives };
   }
 
   // ============================================================================
@@ -772,140 +776,6 @@ Return JSON: { "updated": boolean, "reason": "brief explanation" }`;
   }
 
   /**
-   * Merge similar open loops into single loops with combined context
-   * Checks: title similarity, shared entities + close dates
-   */
-  mergeOpenLoops(loops) {
-    const openLoops = loops.filter(l => l.status === 'open');
-    const resolvedLoops = loops.filter(l => l.status !== 'open');
-    const merged = [];
-    const mergedIds = new Set();
-
-    for (const loop of openLoops) {
-      if (mergedIds.has(loop.id)) continue;
-
-      // Find similar loops by title OR by entity+date proximity
-      const similar = openLoops.filter(other => {
-        if (other.id === loop.id || mergedIds.has(other.id)) return false;
-
-        // Check 1: Title similarity (existing logic)
-        const titleSimilarity = this.calculateTextSimilarity(loop.title, other.title);
-        if (titleSimilarity > 0.5) return true;
-
-        // Check 2: Same entity + dates within 3 days
-        if (this.loopsShareEntityAndCloseDate(loop, other)) return true;
-
-        return false;
-      });
-
-      if (similar.length > 0) {
-        // Merge into primary loop
-        const allRelatedEntities = [...new Set([
-          ...(loop.relatedEntityIds || []),
-          ...similar.flatMap(s => s.relatedEntityIds || [])
-        ])];
-
-        // Use earliest due date
-        const dueDates = [loop.dueDate, ...similar.map(s => s.dueDate)].filter(Boolean);
-        const earliestDue = dueDates.sort()[0] || null;
-
-        // Combine titles/descriptions for context
-        const allTitles = [loop.title, ...similar.map(s => s.title)];
-        const combinedDescription = [
-          loop.description || '',
-          ...similar.map(s => s.description || ''),
-          `(Combined from: ${allTitles.join('; ')})`
-        ].filter(Boolean).join('\n');
-
-        console.log(`🔗 [MERGE] Combining ${similar.length + 1} related loops: "${loop.title}" + ${similar.map(s => `"${s.title}"`).join(', ')}`);
-
-        merged.push({
-          ...loop,
-          relatedEntityIds: allRelatedEntities,
-          dueDate: earliestDue,
-          description: combinedDescription,
-          priority: Math.min(loop.priority || 2, ...similar.map(s => s.priority || 2)),
-          updatedAt: Date.now()
-        });
-
-        similar.forEach(s => mergedIds.add(s.id));
-      } else {
-        merged.push(loop);
-      }
-
-      mergedIds.add(loop.id);
-    }
-
-    return [...merged, ...resolvedLoops];
-  }
-
-  /**
-   * Check if two loops share an entity AND have due dates within 3 days
-   */
-  loopsShareEntityAndCloseDate(loop1, loop2) {
-    // Must share at least one entity
-    const entities1 = loop1.relatedEntityIds || [];
-    const entities2 = loop2.relatedEntityIds || [];
-    const sharedEntities = entities1.filter(e => entities2.includes(e));
-
-    if (sharedEntities.length === 0) return false;
-
-    // Must both have due dates
-    if (!loop1.dueDate || !loop2.dueDate) return false;
-
-    // Dates must be within 3 days
-    const date1 = new Date(loop1.dueDate).getTime();
-    const date2 = new Date(loop2.dueDate).getTime();
-    const daysDiff = Math.abs(date1 - date2) / (24 * 60 * 60 * 1000);
-
-    if (daysDiff <= 3) {
-      console.log(`🔍 [MERGE] Found related loops for ${sharedEntities.join(', ')}: "${loop1.title}" and "${loop2.title}" (${daysDiff.toFixed(1)} days apart)`);
-      return true;
-    }
-
-    return false;
-  }
-
-  /**
-   * Auto-close stale loops that haven't been mentioned in 14+ days
-   * and have no due date or past due date
-   */
-  autoCloseStaleLoops(loops) {
-    const now = Date.now();
-    const STALE_THRESHOLD_DAYS = 14;
-
-    return loops.map(loop => {
-      if (loop.status !== 'open') return loop;
-
-      const lastActivity = loop.updatedAt || loop.createdAt;
-      const daysSinceActivity = (now - lastActivity) / (24 * 60 * 60 * 1000);
-
-      // Check if stale
-      if (daysSinceActivity >= STALE_THRESHOLD_DAYS) {
-        // Check if has future due date (don't auto-close if deadline coming)
-        if (loop.dueDate) {
-          const dueDate = new Date(loop.dueDate).getTime();
-          if (dueDate > now) {
-            // Has future deadline, don't close
-            return loop;
-          }
-        }
-
-        console.log(`🗑️ [STALE] Auto-closing stale loop: "${loop.title}" (${Math.floor(daysSinceActivity)} days inactive)`);
-        return {
-          ...loop,
-          status: 'resolved',
-          resolvedAt: now,
-          resolutionReason: 'auto_closed_stale',
-          updatedAt: now
-        };
-      }
-
-      return loop;
-    });
-  }
-
-  /**
    * Calculate text similarity (word overlap ratio)
    */
   calculateTextSimilarity(text1, text2) {
@@ -1003,7 +873,7 @@ Return JSON: { "updated": boolean, "reason": "brief explanation" }`;
   /**
    * Detect milestone signals using LLM semantic understanding
    */
-  async detectMilestones(journalText, entities, loops) {
+  async detectMilestones(journalText, entities, lifeThreads) {
     if (!anthropicApiKey) {
       console.log('⚠️ [CRS] No Anthropic key - skipping milestone detection');
       return [];
@@ -1014,9 +884,9 @@ Return JSON: { "updated": boolean, "reason": "brief explanation" }`;
       .map(e => `${e.name} (${e.category})`)
       .join(', ');
 
-    const loopList = loops
-      .filter(l => l.status === 'open')
-      .map(l => `- "${l.title}" (due: ${l.dueDate || 'no date'})`)
+    const threadList = (lifeThreads || [])
+      .filter(t => t.status === 'active')
+      .map(t => `- "${t.title}" (${t.category}, next: ${t.nextMilestone || 'none'})`)
       .join('\n');
 
     const systemPrompt = `You are detecting EMOTIONAL MILESTONES in personal journal entries.
@@ -1048,8 +918,8 @@ ${journalText}
 
 KNOWN ENTITIES: ${entityList || 'none'}
 
-EXISTING OPEN LOOPS:
-${loopList || 'none'}
+ACTIVE LIFE THREADS:
+${threadList || 'none'}
 
 For each milestone found, return:
 {
@@ -1058,22 +928,22 @@ For each milestone found, return:
   "daysUntil": number or null,
   "intensity": 1-10,
   "signal": "The key text that signals this",
-  "existingLoopTitle": "If matches an existing loop, its title, else null"
+  "existingThreadTitle": "If matches an existing life thread, its title, else null"
 }`;
 
     try {
       const result = await callClaude(systemPrompt, userPrompt, 0.2);
       const milestones = result.milestones || [];
 
-      // Enrich with entity/loop IDs
+      // Enrich with entity/thread IDs
       return milestones.map(m => {
         const entity = entities.find(e =>
           e.name.toLowerCase() === (m.entityName || '').toLowerCase()
         );
 
-        const loop = loops.find(l =>
-          l.title.toLowerCase() === (m.existingLoopTitle || '').toLowerCase() ||
-          (m.event && l.title.toLowerCase().includes(m.event.toLowerCase().substring(0, 20)))
+        const thread = (lifeThreads || []).find(t =>
+          t.title.toLowerCase() === (m.existingThreadTitle || '').toLowerCase() ||
+          (m.event && t.title.toLowerCase().includes(m.event.toLowerCase().substring(0, 20)))
         );
 
         return {
@@ -1084,8 +954,8 @@ For each milestone found, return:
           intensity: m.intensity || 5,
           entityId: entity?.id || null,
           entityName: entity?.name || m.entityName,
-          loopId: loop?.id || null,
-          loopTitle: loop?.title || null
+          threadId: thread?.id || null,
+          threadTitle: thread?.title || null
         };
       });
 
@@ -1446,413 +1316,247 @@ For each fact return:
   }
 
   // ============================================================================
-  // OPEN LOOP EXTRACTION
+  // LIFE THREADS PROCESSING (PRIMARY TRACKING SYSTEM)
   // ============================================================================
 
-  async processOpenLoops(journalText, entities, facts, existingLoops) {
-    console.log('🔄 [CRS] Processing open loops (fact-first, update-existing)...');
+  /**
+   * Process journals into Life Threads - the primary tracking system for ongoing situations.
+   * Life threads are richer than open loops and directly feed into Horizon's context.
+   * 
+   * Life threads represent ongoing situations in the user's life:
+   * - Relationship dynamics (dating, family situations, friendships)
+   * - Career developments (job searches, projects, work situations)
+   * - Health journeys (fitness goals, medical situations, mental health)
+   * - Financial matters (purchases, investments, budgeting)
+   * - Creative projects (writing, art, music)
+   * - Logistical planning (travel, moving, events)
+   * - Goals being actively pursued
+   */
+  async processLifeThreads(journalText, entities, facts, existingThreads) {
+    console.log('🧵 [CRS] Processing life threads...');
 
-    const entityList = entities.map(e => e.name).join(', ');
+    const entityList = entities.map(e => `${e.name} (${e.category})`).join(', ');
 
-    // Format existing open loops for update consideration
-    const openLoops = existingLoops.filter(l => l.status === 'open');
-    const resolvedLoops = existingLoops.filter(l => l.status !== 'open');
+    // Format existing threads for update consideration
+    const activeThreads = existingThreads.filter(t => !t.resolved);
+    const resolvedThreads = existingThreads.filter(t => t.resolved);
 
-    const existingLoopsFormatted = openLoops.map(l => ({
-      id: l.id,
-      title: l.title,
-      loopType: l.loopType,
-      priority: l.priority,
-      dueDate: l.dueDate,
-      relatedEntities: l.relatedEntityIds?.map(eId => entities.find(e => e.id === eId)?.name).filter(Boolean) || [],
-      notes: l.notes || null
+    const existingThreadsFormatted = activeThreads.map(t => ({
+      id: t.id,
+      title: t.title,
+      category: t.category,
+      status: t.status,
+      currentContext: t.currentContext,
+      emotionalWeight: t.emotionalWeight,
+      nextMilestone: t.nextMilestone,
+      relatedEntities: t.relatedEntities || [],
+      userGuidance: t.userGuidance || []
     }));
 
-    // Find facts that might indicate recurring concerns (potential loop promotions)
-    // Look for facts mentioned multiple times or with temporal markers
-    const recentFactContents = facts.slice(-30).map(f => f.content.toLowerCase());
+    const systemPrompt = `You are a cognitive memory system managing LIFE THREADS from personal journals.
 
-    const systemPrompt = `You are a cognitive memory system managing OPEN LOOPS from personal journals.
+A LIFE THREAD is an ongoing situation in the user's life that they're actively navigating:
+- NOT a task or to-do item
+- NOT a one-time event
+- It's something with EMOTIONAL WEIGHT and CONTEXT that spans days/weeks/months
 
-AN OPEN LOOP is an unresolved item requiring FUTURE action that the user is ACTIVELY TRACKING.
+CATEGORIES:
+- career: Jobs, auditions, projects, work situations
+- relationship: Dating, family dynamics, friendships, social situations
+- health: Fitness goals, medical, mental health journeys
+- financial: Money decisions, purchases, investments
+- creative: Art projects, writing, music, creative pursuits
+- logistical: Travel planning, moving, event organizing
+- waiting: Waiting to hear back on something important
+- goal: Active goals being pursued
 
-YOUR PRIMARY JOB: Update existing loops with new information.
-SECONDARY JOB: Identify items that MUST become loops (strict criteria).
-TERTIARY JOB: Mark loops as resolved if journals indicate completion.
-
-═══════════════════════════════════════════════════════════
-STRICT CRITERIA FOR NEW LOOPS (must meet at least one):
-═══════════════════════════════════════════════════════════
-
-✅ IMMEDIATE LOOP - Create right away:
-1. SCHEDULED EVENT: Specific date/time mentioned ("half-marathon in March", "dentist on Tuesday", "flight Dec 15")
-2. EXPLICIT COMMITMENT: Promise made to someone ("told Sarah I'd help her move", "agreed to review his code")
-3. HARD DEADLINE: External deadline with consequences ("taxes due April 15", "application deadline Friday")
-
-⏳ FACT FIRST - Do NOT create loop yet:
-4. ONE-OFF MENTION: Something noted once without follow-up plan ("check engine light came on", "should call mom", "might try that restaurant")
-5. VAGUE INTENTION: No specific date or commitment ("want to exercise more", "thinking about learning Spanish")
-6. OBSERVATION: Something that happened but has no action ("car made a weird noise", "felt tired today")
-
-These become loops ONLY if:
-- Mentioned in 2+ separate journal entries (shows it's weighing on them)
-- User explicitly says they need to deal with it
-- It becomes blocking or urgent
+YOUR PRIMARY JOB: Update existing threads with new developments.
+SECONDARY JOB: Create new threads only for genuine ongoing situations.
+TERTIARY JOB: Resolve threads when situations conclude.
 
 ═══════════════════════════════════════════════════════════
-LOOP LIFECYCLE:
+WHAT MAKES A GOOD LIFE THREAD:
 ═══════════════════════════════════════════════════════════
 
-NEW → Only if strict criteria met (provide justification)
-UPDATE → New info, date changes, priority shifts, progress notes
-RESOLVE → Journal indicates completion, or user explicitly closed it
-STALE → Will be auto-closed by system if no mention for 14+ days
+✅ CREATE THREAD FOR:
+- Dating situations (meeting someone, navigating a relationship)
+- Job searches or career transitions
+- Health goals they're actively working on
+- Family situations with ongoing dynamics
+- Projects they're invested in emotionally
+- Waiting on important decisions or news
+
+❌ DO NOT CREATE THREAD FOR:
+- One-time events ("Had dinner with mom")
+- Tasks or errands ("Need to buy groceries")
+- General observations ("Feeling tired lately")
+- Completed events ("Finished the book")
 
 ═══════════════════════════════════════════════════════════
-PRIORITY LEVELS:
+THREAD UPDATES:
 ═══════════════════════════════════════════════════════════
 
-1 = URGENT: Deadline within 7 days, or high-stakes commitment
-2 = ACTIVE: Deadline within 30 days, or ongoing tracked item  
-3 = BACKBURNER: No deadline, or 30+ days out
+When updating, capture:
+- Status changes ("went from hopeful to uncertain")
+- New developments ("had the conversation")
+- Emotional shifts ("feeling more confident about it")
+- Next milestones ("meeting their parents Saturday")
+- User guidance ("don't want me to overthink this")
 
 Return JSON: { "updates": [...], "new": [...], "resolve": [...] }`;
 
-    const userPrompt = `Review journals and manage open loops.
+    const userPrompt = `Review journals and manage life threads.
 
-EXISTING OPEN LOOPS:
-${existingLoopsFormatted.length > 0
-        ? JSON.stringify(existingLoopsFormatted, null, 2)
-        : 'None yet'}
+EXISTING THREADS TO POTENTIALLY UPDATE:
+${existingThreadsFormatted.length > 0 ? JSON.stringify(existingThreadsFormatted, null, 2) : 'None yet'}
 
-KNOWN ENTITIES: ${entityList || 'none'}
+KEY ENTITIES: ${entityList || 'None extracted'}
+
+RECENT FACTS:
+${facts.slice(-20).map(f => `- ${f.content}`).join('\n')}
 
 JOURNALS:
 ${journalText}
 
 ═══════════════════════════════════════════════════════════
 
-For each UPDATE to existing loop:
+For each UPDATE:
 {
-  "id": "existing loop id",
-  "note": "What's new (1 sentence)",
-  "dueDateUpdate": "new date if changed, or null",
-  "priorityUpdate": 1-3 if changed, or null
+  "id": "existing thread id",
+  "statusUpdate": "new status (or null if unchanged)",
+  "contextUpdate": "what's new in the situation",
+  "emotionalWeightUpdate": 1-10 (or null if unchanged),
+  "nextMilestoneUpdate": { "date": unix_timestamp, "description": "..." } or null,
+  "addGuidance": "new behavioral guidance" or null
 }
 
-For each NEW loop (strict criteria only, max 2):
+For each NEW thread:
 {
-  "title": "Concrete item (e.g., 'Half-marathon - March 15')",
-  "loopType": "event|task|decision|commitment",
-  "priority": 1-3,
+  "title": "Clear, specific title",
+  "category": "career|relationship|health|financial|creative|logistical|waiting|goal",
+  "status": "Current status in 5-10 words",
+  "currentContext": "2-3 sentences of context",
+  "emotionalWeight": 1-10,
+  "nextMilestone": { "date": unix_timestamp, "description": "..." } or null,
   "relatedEntities": ["entity names"],
-  "dueDate": "specific date if known, or null",
-  "justification": "Which strict criterion does this meet? (scheduled/commitment/deadline)"
+  "justification": "Why this is an ongoing situation worth tracking"
 }
 
-For each loop to RESOLVE:
+For each RESOLVE:
 {
-  "id": "existing loop id",
-  "resolution": "How it was resolved (1 sentence)"
-}
-
-REMEMBER: 
-- One-off mentions → FACT, not loop
-- "Should do X" without date → FACT, not loop  
-- Only scheduled events, commitments, or deadlines → loop`;
+  "id": "thread id",
+  "resolution": "How it concluded (1-2 sentences)"
+}`;
 
     try {
       const result = await callClaude(systemPrompt, userPrompt, 0.3);
 
-      // Process updates to existing loops
-      let updatedLoops = openLoops.map(existing => {
+      // Process updates to existing threads
+      let updatedThreads = activeThreads.map(existing => {
         const update = (result.updates || []).find(u => u.id === existing.id);
 
         if (!update) return existing;
 
-        console.log(`🔄 [CRS] Updating loop "${existing.title}": ${update.note}`);
+        console.log(`🧵 [CRS] Updating thread "${existing.title}": ${update.contextUpdate || 'minor update'}`);
 
-        // Add note to history
-        const notes = existing.notes || [];
-        notes.push({
-          date: new Date().toISOString().split('T')[0],
-          note: update.note
+        // Add update to history
+        const updates = existing.updates || [];
+        updates.push({
+          timestamp: Date.now(),
+          content: update.contextUpdate || update.statusUpdate || 'Updated',
+          source: 'crs'
         });
 
         return {
           ...existing,
-          dueDate: update.dueDateUpdate ? this.parseRelativeDate(update.dueDateUpdate) : existing.dueDate,
-          priority: update.priorityUpdate || existing.priority,
-          notes: notes.slice(-10), // Keep last 10 notes
+          status: update.statusUpdate || existing.status,
+          currentContext: update.contextUpdate || existing.currentContext,
+          emotionalWeight: update.emotionalWeightUpdate ?? existing.emotionalWeight,
+          nextMilestone: update.nextMilestoneUpdate !== undefined 
+            ? update.nextMilestoneUpdate 
+            : existing.nextMilestone,
+          userGuidance: update.addGuidance 
+            ? [...(existing.userGuidance || []), update.addGuidance]
+            : existing.userGuidance,
+          updates: updates.slice(-20), // Keep last 20 updates
+          lastUpdate: Date.now(),
           updatedAt: Date.now()
         };
       });
 
       // Process resolutions
-      const resolveIds = new Set((result.resolve || []).map(r => r.id));
-      updatedLoops = updatedLoops.map(loop => {
-        const resolution = (result.resolve || []).find(r => r.id === loop.id);
+      updatedThreads = updatedThreads.map(thread => {
+        const resolution = (result.resolve || []).find(r => r.id === thread.id);
         if (resolution) {
-          console.log(`✅ [CRS] Resolving loop "${loop.title}": ${resolution.resolution}`);
+          console.log(`✅ [CRS] Resolving thread "${thread.title}": ${resolution.resolution}`);
           return {
-            ...loop,
-            status: 'resolved',
-            resolvedAt: Date.now(),
-            resolutionNote: resolution.resolution,
-            updatedAt: Date.now()
+            ...thread,
+            resolved: true,
+            resolution: resolution.resolution,
+            resolvedAt: Date.now()
           };
         }
-        return loop;
+        return thread;
       });
 
-      // Process new loops (should be rare and justified)
-      const newLoops = (result.new || []).map(l => {
-        // Validate justification exists
-        if (!l.justification) {
-          console.warn(`⚠️ [CRS] Rejecting loop "${l.title}" — no justification provided`);
+      // Process new threads
+      const newThreads = (result.new || []).map(t => {
+        if (!t.justification) {
+          console.log(`⚠️ [CRS] Skipping thread "${t.title}" - no justification`);
           return null;
         }
 
-        console.log(`🔄 [CRS] Creating loop "${l.title}" — ${l.justification}`);
+        console.log(`🧵 [CRS] Creating thread "${t.title}": ${t.justification}`);
 
-        const relatedEntityIds = (l.relatedEntities || [])
-          .map(name => entities.find(e => e.name.toLowerCase() === name.toLowerCase())?.id)
+        // Find related entity IDs
+        const relatedEntityIds = (t.relatedEntities || [])
+          .map(name => {
+            const entity = entities.find(e => 
+              e.name.toLowerCase() === name.toLowerCase()
+            );
+            return entity?.id;
+          })
           .filter(Boolean);
 
         return {
-          id: generateId('loop'),
-          title: l.title,
-          loopType: l.loopType || 'task',
-          priority: l.priority || 2,
-          status: 'open',
-          relatedEntityIds,
-          dueDate: this.parseRelativeDate(l.dueDate) || null,
-          justification: l.justification,
-          notes: [{
-            date: new Date().toISOString().split('T')[0],
-            note: 'Loop created'
-          }],
+          id: `thread_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          title: t.title,
+          category: t.category || 'other',
+          status: t.status || '',
+          currentContext: t.currentContext || '',
+          emotionalWeight: t.emotionalWeight || 5,
+          lastUpdate: Date.now(),
           createdAt: Date.now(),
-          updatedAt: Date.now()
+          updates: [{
+            timestamp: Date.now(),
+            content: t.currentContext || 'Thread created',
+            source: 'crs'
+          }],
+          nextMilestone: t.nextMilestone || null,
+          pastMilestones: [],
+          relatedEntities: relatedEntityIds,
+          relatedThreads: [],
+          userGuidance: [],
+          resolved: false
         };
       }).filter(Boolean);
 
-      // Combine: updated open loops + newly resolved + still resolved + new
-      const nowResolved = updatedLoops.filter(l => l.status === 'resolved');
-      const stillOpen = updatedLoops.filter(l => l.status === 'open');
-      const allLoops = [...stillOpen, ...newLoops, ...nowResolved, ...resolvedLoops];
+      // Combine all
+      const nowResolved = updatedThreads.filter(t => t.resolved);
+      const stillActive = updatedThreads.filter(t => !t.resolved);
+      const allThreads = [...stillActive, ...newThreads, ...nowResolved, ...resolvedThreads];
 
       const updateCount = (result.updates || []).length;
       const resolveCount = (result.resolve || []).length;
-      const newCount = newLoops.length;
-      console.log(`🔄 [CRS] Loops: ${updateCount} updated, ${resolveCount} resolved, ${newCount} new, ${allLoops.length} total`);
+      const newCount = newThreads.length;
+      console.log(`🧵 [CRS] Threads: ${updateCount} updated, ${resolveCount} resolved, ${newCount} new, ${allThreads.length} total`);
 
-      return allLoops;
-
-    } catch (error) {
-      console.error('❌ [CRS] Open loop processing failed:', error.message);
-      return existingLoops;
-    }
-  }
-
-  /**
-   * Scan facts for repeated mentions that should be promoted to loops
-   * "Mentioned twice = becoming a thing the user is tracking"
-   */
-  async promoteFactsToLoops(facts, entities, existingLoops) {
-    console.log('🔍 [CRS] Scanning for fact → loop promotions...');
-
-    // Get existing loop titles/topics to avoid duplicates
-    const openLoopTitles = existingLoops
-      .filter(l => l.status === 'open')
-      .map(l => l.title.toLowerCase());
-
-    // Group facts by entity + rough topic
-    // Look for facts about the same thing mentioned on different dates
-    const factGroups = this.groupFactsByTopic(facts);
-
-    // Filter to groups with 2+ mentions that aren't already loops
-    const candidates = factGroups.filter(group => {
-      if (group.facts.length < 2) return false;
-
-      // Check if already covered by an existing loop
-      const isAlreadyLoop = openLoopTitles.some(title => {
-        const groupWords = new Set(group.topic.toLowerCase().split(/\s+/));
-        const titleWords = new Set(title.split(/\s+/));
-        const overlap = [...groupWords].filter(w => titleWords.has(w) && w.length > 3).length;
-        return overlap >= 2;
-      });
-
-      if (isAlreadyLoop) return false;
-
-      // Check if mentions span multiple days (not just same-day repetition)
-      const dates = new Set(group.facts.map(f => {
-        const d = new Date(f.createdAt);
-        return d.toISOString().split('T')[0];
-      }));
-
-      return dates.size >= 2; // Mentioned on 2+ different days
-    });
-
-    if (candidates.length === 0) {
-      console.log('🔍 [CRS] No facts ready for promotion');
-      return [];
-    }
-
-    console.log(`🔍 [CRS] Found ${candidates.length} candidate fact clusters for promotion`);
-
-    // Use LLM to decide which candidates should become loops
-    const systemPrompt = `You are evaluating whether REPEATED FACTS should be promoted to OPEN LOOPS.
-
-A fact cluster should become a loop if:
-1. It represents something UNRESOLVED that needs action
-2. The user is clearly TRACKING or THINKING about it (mentioned 2+ times)
-3. It's not just an observation or completed event
-
-Examples:
-✅ PROMOTE: "Check engine light" mentioned 3x over a week → User is worried, needs to deal with it
-✅ PROMOTE: "Mom's birthday" mentioned 2x → Upcoming event user is thinking about
-✅ PROMOTE: "Lease renewal" mentioned 2x → Decision/deadline approaching
-
-🚫 DON'T PROMOTE: "Had coffee with Sarah" 2x → Just recording events, not unresolved
-🚫 DON'T PROMOTE: "Feeling tired" 3x → Observation/pattern, not actionable loop
-🚫 DON'T PROMOTE: "Work was busy" 2x → General state, not a tracked item
-
-Return JSON: { "promote": [...], "skip": [...] }`;
-
-    const candidateSummaries = candidates.map((c, i) => ({
-      index: i,
-      topic: c.topic,
-      mentionCount: c.facts.length,
-      entityName: c.entityName,
-      samples: c.facts.slice(0, 3).map(f => f.content)
-    }));
-
-    const userPrompt = `Evaluate these repeated fact clusters for promotion to open loops:
-
-${JSON.stringify(candidateSummaries, null, 2)}
-
-For each cluster, decide:
-- PROMOTE: User is tracking something unresolved → create a loop
-- SKIP: Just observations, completed events, or patterns → leave as facts
-
-For each PROMOTE:
-{
-  "index": number,
-  "title": "Loop title",
-  "loopType": "task|decision|event|concern",
-  "priority": 2-3,
-  "reason": "Why this deserves to be tracked as a loop"
-}
-
-For each SKIP:
-{
-  "index": number,
-  "reason": "Why this should stay as facts"
-}`;
-
-    try {
-      const result = await callClaude(systemPrompt, userPrompt, 0.2);
-
-      const newLoops = (result.promote || []).map(p => {
-        const candidate = candidates[p.index];
-        if (!candidate) return null;
-
-        console.log(`⬆️ [CRS] Promoting "${candidate.topic}" to loop: ${p.reason}`);
-
-        // Find related entity
-        const entity = entities.find(e =>
-          e.name.toLowerCase() === (candidate.entityName || '').toLowerCase()
-        );
-
-        return {
-          id: generateId('loop'),
-          title: p.title,
-          loopType: p.loopType || 'concern',
-          priority: p.priority || 2,
-          status: 'open',
-          relatedEntityIds: entity ? [entity.id] : [],
-          dueDate: null,
-          promotedFromFacts: candidate.facts.map(f => f.id),
-          promotionReason: p.reason,
-          notes: [{
-            date: new Date().toISOString().split('T')[0],
-            note: `Promoted from ${candidate.facts.length} fact mentions`
-          }],
-          createdAt: Date.now(),
-          updatedAt: Date.now()
-        };
-      }).filter(Boolean);
-
-      // Log skips for debugging
-      for (const skip of (result.skip || [])) {
-        const candidate = candidates[skip.index];
-        if (candidate) {
-          console.log(`➡️ [CRS] Keeping "${candidate.topic}" as facts: ${skip.reason}`);
-        }
-      }
-
-      console.log(`⬆️ [CRS] Promoted ${newLoops.length} fact clusters to loops`);
-      return newLoops;
+      return allThreads;
 
     } catch (error) {
-      console.error('❌ [CRS] Fact promotion failed:', error.message);
-      return [];
+      console.error('❌ [CRS] Life thread processing failed:', error.message);
+      return existingThreads;
     }
-  }
-
-  /**
-   * Group facts by entity + semantic topic for promotion analysis
-   */
-  groupFactsByTopic(facts) {
-    const groups = [];
-    const processed = new Set();
-
-    for (const fact of facts) {
-      if (processed.has(fact.id)) continue;
-
-      // Find similar facts (same entity + word overlap)
-      const similar = facts.filter(other => {
-        if (other.id === fact.id || processed.has(other.id)) return false;
-        if (other.entityId !== fact.entityId) return false;
-
-        const similarity = this.calculateTextSimilarity(fact.content, other.content);
-        return similarity > 0.4;
-      });
-
-      if (similar.length > 0) {
-        const allFacts = [fact, ...similar];
-        allFacts.forEach(f => processed.add(f.id));
-
-        // Extract topic from the facts
-        const words = allFacts
-          .flatMap(f => f.content.toLowerCase().split(/\s+/))
-          .filter(w => w.length > 3);
-
-        const wordCounts = {};
-        for (const w of words) {
-          wordCounts[w] = (wordCounts[w] || 0) + 1;
-        }
-
-        const topWords = Object.entries(wordCounts)
-          .sort((a, b) => b[1] - a[1])
-          .slice(0, 4)
-          .map(([word]) => word);
-
-        const entityName = allFacts[0].entityId === 'self'
-          ? null
-          : allFacts[0].entityId?.replace('entity_', '').replace(/_/g, ' ');
-
-        groups.push({
-          topic: topWords.join(' '),
-          entityId: fact.entityId,
-          entityName,
-          facts: allFacts
-        });
-      }
-    }
-
-    return groups;
   }
 
   // ============================================================================
@@ -2135,7 +1839,7 @@ For each NEW narrative (rare, max 1) return:
   async exportCRSOutputsToSystemFS(crsOutputs) {
     console.log('📤 [CRS] Exporting to /system file structure...');
 
-    const { entities, facts, loops, patterns, narratives } = crsOutputs;
+    const { entities, facts, lifeThreads, patterns, narratives } = crsOutputs;
 
     // Export entities by category
     const usedEntitySlugs = new Set();
@@ -2180,19 +1884,19 @@ For each NEW narrative (rare, max 1) return:
       await this.writeFile(path, fact);
     }
 
-    // Export loops
-    const usedLoopSlugs = new Set();
-    for (const loop of loops) {
-      const dir = loop.status === 'resolved' ? 'resolved/' : '';
-      let slug = slugify(loop.title);
+    // Export LIFE THREADS (the tracking system for ongoing situations)
+    const usedThreadSlugs = new Set();
+    for (const thread of (lifeThreads || [])) {
+      const dir = thread.resolved ? 'resolved/' : '';
+      let slug = slugify(thread.title);
 
-      if (usedLoopSlugs.has(slug)) {
-        slug = `${slug}_${loop.id.slice(-6)}`;
+      if (usedThreadSlugs.has(slug)) {
+        slug = `${slug}_${thread.id.slice(-6)}`;
       }
-      usedLoopSlugs.add(slug);
+      usedThreadSlugs.add(slug);
 
-      const path = `system/open_loops/${dir}${slug}.json`;
-      await this.writeFile(path, loop);
+      const path = `system/life_threads/${dir}${slug}.json`;
+      await this.writeFile(path, thread);
     }
 
     // Export patterns
@@ -2232,26 +1936,26 @@ For each NEW narrative (rare, max 1) return:
       await this.writeFile(path, narrative);
     }
 
-    console.log(`✅ [CRS] Exported ${entities.length} entities, ${facts.length} facts, ${loops.length} loops, ${patterns.length} patterns, ${narratives.length} narratives`);
+    console.log(`✅ [CRS] Exported ${entities.length} entities, ${facts.length} facts, ${(lifeThreads || []).length} life threads, ${patterns.length} patterns, ${narratives.length} narratives`);
   }
 
   /**
    * Generate update manifest for RTCS sync
    */
   async generateUpdateManifest(crsOutputs) {
-    const { entities, facts, loops, patterns, narratives } = crsOutputs;
+    const { entities, facts, lifeThreads, patterns, narratives } = crsOutputs;
 
     const manifest = {
       timestamp: Date.now(),
       processedAt: new Date().toISOString(),
       updatedEntities: entities.map(e => e.id),
       updatedFacts: facts.map(f => f.id),
-      updatedLoops: loops.map(l => l.id),
+      updatedLifeThreads: (lifeThreads || []).map(t => t.id),
       updatedPatterns: patterns.map(p => p.id),
       updatedNarratives: narratives.map(n => n.id),
       totalEntities: entities.length,
       totalFacts: facts.length,
-      totalLoops: loops.length,
+      totalLifeThreads: (lifeThreads || []).length,
       totalPatterns: patterns.length,
       totalNarratives: narratives.length,
       processingTimeMs: this.lastProcessingTime ? Date.now() - this.lastProcessingTime : null
@@ -2279,7 +1983,7 @@ For each NEW narrative (rare, max 1) return:
       return this.getFallbackQuestions();
     }
 
-    const { entities, facts, loops, patterns, narratives } = crsOutputs;
+    const { entities, facts, lifeThreads, patterns, narratives } = crsOutputs;
 
     // Load RECENT journal entries (last 3 days) - this is the key differentiator
     const recentJournals = await this.loadRecentJournalText(3);
@@ -2289,13 +1993,12 @@ For each NEW narrative (rare, max 1) return:
     const dayOfWeek = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][today.getDay()];
     const dateStr = today.toISOString().split('T')[0];
 
-    // Only include URGENT loops (due within 7 days) or high priority
-    const urgentLoops = loops.filter(l => {
-      if (l.status !== 'open') return false;
-      if (l.priority === 1) return true;
-      if (l.dueDate) {
-        const dueDate = new Date(l.dueDate);
-        const daysUntil = (dueDate.getTime() - today.getTime()) / (24 * 60 * 60 * 1000);
+    // Only include high-weight active life threads
+    const urgentThreads = (lifeThreads || []).filter(t => {
+      if (t.resolved) return false;
+      if (t.emotionalWeight >= 7) return true;
+      if (t.nextMilestone && t.nextMilestone.date) {
+        const daysUntil = (t.nextMilestone.date - today.getTime()) / (24 * 60 * 60 * 1000);
         return daysUntil <= 7 && daysUntil >= 0;
       }
       return false;
@@ -2348,11 +2051,11 @@ RECENT JOURNAL ENTRIES (PRIMARY SOURCE - anchor questions here):
 ${recentJournals || 'No recent entries found.'}
 
 ═══════════════════════════════════════════════════════════
-URGENT/IMMINENT (secondary context):
+ACTIVE LIFE THREADS (secondary context):
 ═══════════════════════════════════════════════════════════
-${urgentLoops.length > 0
-        ? urgentLoops.map(l => `- ${l.title}${l.dueDate ? ` (${l.dueDate})` : ''}`).join('\n')
-        : 'Nothing urgent'}
+${urgentThreads.length > 0
+        ? urgentThreads.map(t => `- ${t.title} (${t.category}, weight: ${t.emotionalWeight})`).join('\n')
+        : 'No urgent threads'}
 
 ${milestoneEntities.length > 0
         ? `UPCOMING MILESTONES:\n${milestoneEntities.map(e => `- ${e.name}: ${e.milestoneDate || 'soon'}`).join('\n')}`
@@ -2751,7 +2454,7 @@ If journals are empty, generate questions about what's urgent/imminent instead.`
     try {
       const entities = await this.loadExistingSystemFiles('entities');
       const facts = await this.loadExistingSystemFiles('facts');
-      const openLoops = await this.loadExistingSystemFiles('open_loops');
+      const lifeThreads = await this.loadExistingSystemFiles('life_threads');
       const narratives = await this.loadExistingSystemFiles('narratives');
       const patterns = await this.loadExistingSystemFiles('patterns');
       const manifest = await this.readFile('system/updates/latest.json');
@@ -2764,7 +2467,7 @@ If journals are empty, generate questions about what's urgent/imminent instead.`
         // Flat arrays for RTCS sync
         entities,
         facts,
-        open_loops: openLoops,  // Key name matches RTCS expectation
+        life_threads: lifeThreads,  // Primary tracking system (replaces open_loops)
         narratives,
         patterns,
         manifest,

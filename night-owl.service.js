@@ -1,17 +1,17 @@
 /**
  * Night Owl Service
  * 
- * Autonomous background intelligence that works on open loops while you sleep.
+ * Autonomous background intelligence that works on life threads while you sleep.
  * 
  * CAPABILITIES:
  * 
- * 1. OPEN LOOP PROCESSING
+ * 1. LIFE THREAD PROCESSING
  *    - Research: "Planning Alaska trip" → destinations, activities, logistics
  *    - Decisions: "Should I take the job?" → weighs against values/patterns
  *    - Preparation: "Talk to Sarah about X" → approaches, anticipation
  * 
  * 2. ANTICIPATORY PREP
- *    - Tomorrow's calendar → pulls context on people, open loops
+ *    - Tomorrow's calendar → pulls context on people, life threads
  *    - Upcoming birthdays → gift ideas based on relationship knowledge
  *    - Upcoming trips → logistics, packing, things you mentioned
  * 
@@ -55,21 +55,22 @@ import Anthropic from '@anthropic-ai/sdk';
 // ============================================================================
 
 /**
- * @typedef {Object} OpenLoop
+ * @typedef {Object} LifeThread
  * @property {string} id
  * @property {string} title
- * @property {string} loopType - task|decision|followup|commitment|question|plan
- * @property {number} priority - 1-3
- * @property {string} [description]
- * @property {string[]} [relatedEntityIds]
- * @property {string} status - open|resolved
+ * @property {string} category - career|relationship|health|finance|creative|logistics|goal|waiting
+ * @property {string} status - Current situation summary
+ * @property {string} currentContext - Detailed current state
+ * @property {number} emotionalWeight - 1-10
+ * @property {string[]} [relatedEntities]
+ * @property {boolean} resolved
  */
 
 /**
  * @typedef {Object} NightOwlInsight
  * @property {string} id
- * @property {string} loopId
- * @property {string} loopTitle
+ * @property {string} threadId
+ * @property {string} threadTitle
  * @property {string} insightType - research|perspective|suggestion|preparation
  * @property {string} content - The actual insight/research
  * @property {string} conversationHook - Natural way to bring it up
@@ -82,7 +83,7 @@ import Anthropic from '@anthropic-ai/sdk';
 /**
  * @typedef {Object} StagedAction
  * @property {string} id
- * @property {'create_note'|'add_calendar_event'|'update_loop'|'resolve_loop'|'create_loop'|'add_fact'} type
+ * @property {'create_note'|'add_calendar_event'|'update_thread'|'resolve_thread'|'create_thread'|'add_fact'} type
  * @property {Object} payload - Data needed to execute the action
  * @property {string} description - Human-readable description of what this action does
  * @property {boolean} requiresApproval - If true, user must explicitly approve
@@ -100,7 +101,7 @@ import Anthropic from '@anthropic-ai/sdk';
 /**
  * @typedef {Object} NightOwlSettings
  * @property {boolean} enabled - Master switch
- * @property {boolean} autonomousProcessing - Process loops, patterns automatically
+ * @property {boolean} autonomousProcessing - Process threads, patterns automatically
  * @property {boolean} processQueuedOnly - Only process user-requested analyses
  * @property {boolean} notificationsEnabled
  * @property {'immediate'|'morning'} notificationTiming
@@ -122,6 +123,9 @@ const DEFAULT_SETTINGS = {
   pausedUntil: null
 };
 
+// Web search tool definition - API requires both name and type fields
+const WEB_SEARCH_TOOL = { type: 'web_search_20250305', name: 'web_search' };
+
 // ============================================================================
 // NIGHT OWL SERVICE
 // ============================================================================
@@ -130,8 +134,8 @@ class NightOwlService {
   constructor(crsService, config = {}) {
     this.crsService = crsService;
     this.anthropicApiKey = config.anthropicApiKey || process.env.ANTHROPIC_API_KEY;
-    this.maxLoopsPerRun = config.maxLoopsPerRun || 3;
-    this.minPriority = config.minPriority || 2; // Process priority 1 and 2
+    this.maxThreadsPerRun = config.maxThreadsPerRun || 3;
+    this.minEmotionalWeight = config.minEmotionalWeight || 5; // Process threads with weight >= 5
     this.settings = DEFAULT_SETTINGS;
     
     // In-memory queue cache to avoid Supabase sync latency issues
@@ -172,35 +176,33 @@ class NightOwlService {
   }
 
   /**
-   * Pause autonomous processing until user queues something
+   * Disable autonomous processing (only runs queued at 2 AM)
    */
-  async pauseAutonomous() {
+  async disableAutonomous() {
     await this.saveSettings({
       autonomousProcessing: false,
-      processQueuedOnly: true,
       pausedUntil: null
     });
-    console.log('🦉 [NightOwl] Autonomous processing paused. Will only process queued requests.');
+    console.log('🦉 [NightOwl] Autonomous processing disabled. Only queued requests will run at 2 AM.');
   }
 
   /**
-   * Resume autonomous processing
+   * Enable autonomous processing (full processing at 2 AM)
    */
-  async resumeAutonomous() {
+  async enableAutonomous() {
     await this.saveSettings({
       autonomousProcessing: true,
-      processQueuedOnly: false,
       pausedUntil: null
     });
-    console.log('🦉 [NightOwl] Autonomous processing resumed.');
+    console.log('🦉 [NightOwl] Autonomous processing enabled. Full processing will run at 2 AM.');
   }
 
   /**
    * Check if we should run autonomous processors
+   * Only used by processAll() which runs at 2 AM
    */
   shouldRunAutonomous() {
     if (!this.settings.enabled) return false;
-    if (this.settings.processQueuedOnly) return false;
     if (!this.settings.autonomousProcessing) return false;
     if (this.settings.pausedUntil && Date.now() < this.settings.pausedUntil) return false;
     return true;
@@ -488,6 +490,7 @@ class NightOwlService {
 
   /**
    * Main entry point - called by backend at 2 AM
+   * Processes both queued requests AND autonomous insights
    */
   async processAll() {
     await this.initialize();
@@ -502,7 +505,7 @@ class NightOwlService {
       return { success: true, insightCount: 0, skipped: true, reason: 'no_api_key' };
     }
 
-    console.log('🦉 [NightOwl] Starting nightly processing...');
+    console.log('🦉 [NightOwl] Starting nightly processing (2 AM batch)...');
     const startTime = Date.now();
     const allInsights = [];
 
@@ -513,19 +516,13 @@ class NightOwlService {
       const trackingData = await this.getTrackingDataFromStore();
 
       // ============================================================
-      // PHASE 1: QUEUED REQUESTS (always process these)
+      // PHASE 1: QUEUED REQUESTS (always process these first)
       // ============================================================
       const queuedInsights = await this.processQueuedRequests(userContext, healthData, trackingData);
       allInsights.push(...queuedInsights);
 
-      // If user queued something, resume autonomous for next time
-      if (queuedInsights.length > 0 && this.settings.processQueuedOnly) {
-        console.log('🦉 [NightOwl] User queued requests - will resume autonomous next run');
-        await this.saveSettings({ processQueuedOnly: false, autonomousProcessing: true });
-      }
-
       // ============================================================
-      // PHASE 2: AUTONOMOUS PROCESSING (if enabled)
+      // PHASE 2: AUTONOMOUS PROCESSING (only at 2 AM batch)
       // ============================================================
       if (this.shouldRunAutonomous()) {
         console.log('🦉 [NightOwl] Running autonomous processors...');
@@ -536,7 +533,7 @@ class NightOwlService {
           allInsights.push(...autonomous);
         }
       } else {
-        console.log('🦉 [NightOwl] Autonomous processing disabled/paused. Skipping.');
+        console.log('🦉 [NightOwl] Autonomous processing disabled. Skipping.');
       }
 
       // ============================================================
@@ -581,6 +578,54 @@ class NightOwlService {
     } catch (error) {
       console.error('❌ [NightOwl] Processing failed:', error);
       return { success: false, error: error.message, insightCount: allInsights.length };
+    }
+  }
+
+  /**
+   * Process ONLY queued research requests - NO autonomous processing
+   * Use this for on-demand/immediate processing triggered by user
+   */
+  async processQueuedOnly() {
+    await this.initialize();
+
+    if (!this.anthropic) {
+      console.log('🦉 [NightOwl] Skipping - no API key configured');
+      return { success: true, insightCount: 0, skipped: true, reason: 'no_api_key' };
+    }
+
+    console.log('🦉 [NightOwl] Processing queued requests only (on-demand)...');
+    const startTime = Date.now();
+
+    try {
+      // Load context
+      const userContext = await this.getUserContext();
+      const healthData = await this.getHealthData();
+      const trackingData = await this.getTrackingDataFromStore();
+
+      // Process ONLY queued requests - no autonomous
+      const queuedInsights = await this.processQueuedRequests(userContext, healthData, trackingData);
+
+      // Save insights
+      for (const insight of queuedInsights) {
+        await this.saveInsight(insight);
+      }
+
+      const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+      console.log(`🦉 [NightOwl] Queued processing complete in ${elapsed}s. ${queuedInsights.length} insights generated.`);
+
+      return {
+        success: true,
+        insightCount: queuedInsights.length,
+        breakdown: {
+          queued: queuedInsights.length,
+          autonomous: 0
+        },
+        elapsed: parseFloat(elapsed)
+      };
+
+    } catch (error) {
+      console.error('❌ [NightOwl] Queued processing failed:', error);
+      return { success: false, error: error.message, insightCount: 0 };
     }
   }
 
@@ -717,7 +762,7 @@ Please provide your analysis.`;
       const response = await this.anthropic.messages.create({
         model: 'claude-sonnet-4-20250514',
         max_tokens: 2000,
-        tools: request.type === 'research' ? [{ type: 'web_search_20250305' }] : [],
+        tools: request.type === 'research' ? [WEB_SEARCH_TOOL] : [],
         messages: [{ role: 'user', content: userPrompt }],
         system: systemPrompt
       });
@@ -895,8 +940,15 @@ Please provide your analysis.`;
 
   /**
    * Get queue status
+   * @param {boolean} forceRefresh - If true, bypass cache and read fresh from storage
    */
-  async getQueueStatus() {
+  async getQueueStatus(forceRefresh = false) {
+    if (forceRefresh) {
+      // Invalidate cache
+      this.queueCache = null;
+      this.queueCacheTime = 0;
+    }
+    
     const queueFile = await this.getQueueFile();
     const pending = queueFile.requests?.filter(r => r.status === 'pending') || [];
     const completed = queueFile.requests?.filter(r => r.status === 'completed') || [];
@@ -909,6 +961,178 @@ Please provide your analysis.`;
       undelivered,
       settings: this.settings
     };
+  }
+
+  /**
+   * Get a single queue item by ID
+   */
+  async getQueueItem(requestId) {
+    const queueFile = await this.getQueueFile();
+    return queueFile.requests?.find(r => r.id === requestId) || null;
+  }
+
+  /**
+   * Update an existing queue item
+   * Only allows updating pending requests
+   */
+  async updateQueueItem(requestId, updates) {
+    const queueFile = await this.getQueueFile();
+    const index = queueFile.requests?.findIndex(r => r.id === requestId);
+    
+    if (index === -1 || index === undefined) {
+      console.log(`⚠️ [NightOwl] Queue item ${requestId} not found`);
+      return null;
+    }
+    
+    const item = queueFile.requests[index];
+    
+    // Only allow updating pending items
+    if (item.status !== 'pending') {
+      console.log(`⚠️ [NightOwl] Cannot update ${item.status} queue item ${requestId}`);
+      return null;
+    }
+    
+    // Allowed fields to update
+    const allowedFields = ['request', 'type', 'context', 'priority', 'dataSources', 'dateRange'];
+    const updatedItem = { ...item };
+    
+    for (const field of allowedFields) {
+      if (updates[field] !== undefined) {
+        updatedItem[field] = updates[field];
+      }
+    }
+    
+    updatedItem.updatedAt = Date.now();
+    queueFile.requests[index] = updatedItem;
+    
+    // Update cache
+    this.queueCache = queueFile;
+    this.queueCacheTime = Date.now();
+    
+    // Save to storage
+    await this.crsService.writeFile('system/nightowl/queue.json', queueFile);
+    
+    console.log(`📝 [NightOwl] Updated queue item ${requestId}: "${updatedItem.request?.slice(0, 50)}..."`);
+    return updatedItem;
+  }
+
+  /**
+   * Remove a queue item by ID
+   * Can remove pending items, marks completed/failed items as 'removed'
+   */
+  async removeQueueItem(requestId) {
+    // Invalidate cache to get fresh data
+    this.queueCache = null;
+    this.queueCacheTime = 0;
+    
+    const queueFile = await this.getQueueFile();
+    const index = queueFile.requests?.findIndex(r => r.id === requestId);
+    
+    if (index === -1 || index === undefined) {
+      console.log(`⚠️ [NightOwl] Queue item ${requestId} not found`);
+      return false;
+    }
+    
+    const item = queueFile.requests[index];
+    
+    if (item.status === 'pending') {
+      // Actually remove pending items
+      queueFile.requests.splice(index, 1);
+      console.log(`🗑️ [NightOwl] Removed pending queue item ${requestId}`);
+    } else {
+      // Mark completed/failed items as removed (keep for history)
+      queueFile.requests[index].status = 'removed';
+      queueFile.requests[index].removedAt = Date.now();
+      console.log(`🗑️ [NightOwl] Marked queue item ${requestId} as removed`);
+    }
+    
+    // Update cache
+    this.queueCache = queueFile;
+    this.queueCacheTime = Date.now();
+    
+    // Save to storage
+    await this.crsService.writeFile('system/nightowl/queue.json', queueFile);
+    
+    return true;
+  }
+
+  /**
+   * Clear all pending queue items
+   */
+  async clearPendingQueue() {
+    try {
+      // Invalidate cache to force fresh read from storage
+      this.queueCache = null;
+      this.queueCacheTime = 0;
+      
+      // Read fresh from storage (bypass cache)
+      let queueFile;
+      try {
+        queueFile = await this.crsService.readFile('system/nightowl/queue.json');
+        if (!queueFile || !queueFile.requests) {
+          queueFile = { requests: [] };
+        }
+      } catch {
+        queueFile = { requests: [] };
+      }
+      
+      const pending = queueFile.requests?.filter(r => r.status === 'pending') || [];
+      const clearedCount = pending.length;
+      
+      // Keep non-pending items
+      queueFile.requests = queueFile.requests?.filter(r => r.status !== 'pending') || [];
+      
+      // Update cache
+      this.queueCache = queueFile;
+      this.queueCacheTime = Date.now();
+      
+      // Save to storage
+      await this.crsService.writeFile('system/nightowl/queue.json', queueFile);
+      
+      console.log(`🧹 [NightOwl] Cleared ${clearedCount} pending queue items`);
+      return clearedCount;
+    } catch (error) {
+      console.error('❌ [NightOwl] clearPendingQueue failed:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Reorder queue items by priority or custom order
+   * @param {string[]} orderedIds - Array of request IDs in desired order
+   */
+  async reorderQueue(orderedIds) {
+    const queueFile = await this.getQueueFile();
+    const pending = queueFile.requests?.filter(r => r.status === 'pending') || [];
+    const nonPending = queueFile.requests?.filter(r => r.status !== 'pending') || [];
+    
+    // Reorder pending items based on provided order
+    const reordered = [];
+    for (const id of orderedIds) {
+      const item = pending.find(r => r.id === id);
+      if (item) {
+        reordered.push(item);
+      }
+    }
+    
+    // Add any pending items not in the order list at the end
+    for (const item of pending) {
+      if (!orderedIds.includes(item.id)) {
+        reordered.push(item);
+      }
+    }
+    
+    queueFile.requests = [...reordered, ...nonPending];
+    
+    // Update cache
+    this.queueCache = queueFile;
+    this.queueCacheTime = Date.now();
+    
+    // Save to storage
+    await this.crsService.writeFile('system/nightowl/queue.json', queueFile);
+    
+    console.log(`🔄 [NightOwl] Reordered ${reordered.length} pending queue items`);
+    return reordered;
   }
 
   // ============================================================================
@@ -924,7 +1148,7 @@ Please provide your analysis.`;
     // Run processors in priority order, stopping when we hit max
     const processors = [
       { name: 'milestones', fn: () => this.processMilestones(userContext) },
-      { name: 'openLoops', fn: () => this.processOpenLoops(userContext) },
+      { name: 'threads', fn: () => this.processLifeThreads(userContext) },
       { name: 'anticipatory', fn: () => this.processAnticipatoryPrep(userContext) },
       { name: 'patterns', fn: () => this.surfacePatterns(userContext, healthData, trackingData) },
       { name: 'health', fn: () => this.analyzeHealthCorrelations(userContext, healthData, trackingData) },
@@ -958,8 +1182,8 @@ Please provide your analysis.`;
    * Process milestones specifically (high priority)
    */
   async processMilestones(userContext) {
-    const loops = await this.crsService.loadExistingSystemFiles('open_loops');
-    const milestones = loops.filter(l => l.status === 'open' && l.isMilestone);
+    const threads = await this.crsService.loadExistingSystemFiles('life_threads');
+    const milestones = (threads || []).filter(t => !t.resolved && t.nextMilestone);
 
     const insights = [];
     for (const milestone of milestones.slice(0, 2)) {
@@ -972,7 +1196,7 @@ Please provide your analysis.`;
   dedupeInsights(insights) {
     const seen = new Set();
     return insights.filter(i => {
-      const key = i.loopId || i.loopTitle;
+      const key = i.threadId || i.threadTitle;
       if (seen.has(key)) return false;
       seen.add(key);
       return true;
@@ -1125,54 +1349,102 @@ Please provide your analysis.`;
   }
 
   /**
-   * Process open loops (original functionality)
+   * Process life threads for autonomous insights
    */
-  async processOpenLoops(userContext) {
-    const loops = await this.getWorkableLoops();
-    console.log(`🦉 [NightOwl] Processing ${loops.length} open loops...`);
-
+  async processLifeThreads(userContext) {
+    const threads = await this.getWorkableLifeThreads();
+    
+    if (threads.length === 0) {
+      console.log(`🦉 [NightOwl] No workable life threads to process`);
+      return [];
+    }
+    
+    console.log(`🦉 [NightOwl] Processing ${threads.length} life threads...`);
     const insights = [];
-    for (const loop of loops) {
+    for (const thread of threads) {
       try {
-        const insight = await this.processLoop(loop, userContext);
+        const insight = await this.processLifeThread(thread, userContext);
         if (insight) insights.push(insight);
       } catch (error) {
-        console.error(`❌ [NightOwl] Failed to process loop "${loop.title}":`, error.message);
+        console.error(`❌ [NightOwl] Failed to process thread "${thread.title}":`, error.message);
       }
     }
     return insights;
   }
 
   // ============================================================================
-  // LOOP SELECTION
+  // LIFE THREAD SELECTION
   // ============================================================================
 
   /**
-   * Get loops that are worth autonomous work
+   * Get life threads that are worth autonomous work
    */
-  async getWorkableLoops() {
-    const allLoops = await this.crsService.loadExistingSystemFiles('open_loops');
+  async getWorkableLifeThreads() {
+    const allThreads = await this.crsService.loadExistingSystemFiles('life_threads');
 
-    // Filter to open, high-priority, workable loops
-    const workable = allLoops
-      .filter(loop => {
-        if (loop.status !== 'open') return false;
-        if (loop.priority > this.minPriority) return false;
-
-        // Focus on types that benefit from research/thinking
-        const workableTypes = ['decision', 'plan', 'question', 'task'];
-        if (!workableTypes.includes(loop.loopType)) return false;
+    // Filter to active, high emotional weight threads
+    const workable = (allThreads || [])
+      .filter(thread => {
+        if (thread.resolved) return false;
+        
+        // Focus on threads with emotional weight >= minEmotionalWeight
+        const weight = thread.emotionalWeight || 5;
+        if (weight < this.minEmotionalWeight) return false;
+        
+        // Focus on categories that benefit from autonomous thinking
+        const workableCategories = ['career', 'relationship', 'health', 'financial', 'goal', 'waiting'];
+        if (!workableCategories.includes(thread.category)) return false;
 
         return true;
       })
       .sort((a, b) => {
-        // Sort by priority (1 first), then by creation date
-        if (a.priority !== b.priority) return a.priority - b.priority;
-        return (b.createdAt || 0) - (a.createdAt || 0);
+        // Sort by emotional weight (highest first), then by recency
+        const weightDiff = (b.emotionalWeight || 5) - (a.emotionalWeight || 5);
+        if (weightDiff !== 0) return weightDiff;
+        return (b.lastUpdate || 0) - (a.lastUpdate || 0);
       })
-      .slice(0, this.maxLoopsPerRun);
+      .slice(0, this.maxThreadsPerRun);
 
     return workable;
+  }
+
+  /**
+   * Process a single life thread and generate insight
+   */
+  async processLifeThread(thread, userContext) {
+    const strategy = await this.determineThreadStrategy(thread);
+
+    switch (strategy) {
+      case 'research':
+        return await this.doThreadResearch(thread, userContext);
+      case 'decision':
+        return await this.analyzeThreadDecision(thread, userContext);
+      case 'preparation':
+        return await this.prepareThreadApproach(thread, userContext);
+      case 'reflection':
+        return await this.reflectOnThread(thread, userContext);
+      default:
+        return await this.thinkThroughThread(thread, userContext);
+    }
+  }
+
+  /**
+   * Determine what kind of work this thread needs
+   */
+  async determineThreadStrategy(thread) {
+    // Use category and context to determine strategy
+    if (thread.category === 'waiting') return 'reflection';
+    if (thread.category === 'career' && thread.status?.toLowerCase().includes('decision')) return 'decision';
+    if (thread.category === 'relationship' && thread.nextMilestone) return 'preparation';
+    if (thread.category === 'goal') return 'research';
+    
+    // Default based on context
+    const context = (thread.currentContext || '').toLowerCase();
+    if (context.includes('decide') || context.includes('choice')) return 'decision';
+    if (context.includes('meeting') || context.includes('talk to')) return 'preparation';
+    if (context.includes('learn') || context.includes('plan')) return 'research';
+    
+    return 'reflection';
   }
 
   // ============================================================================
@@ -1224,77 +1496,359 @@ Please provide your analysis.`;
   }
 
   // ============================================================================
-  // LOOP PROCESSING
+  // LIFE THREAD PROCESSING
   // ============================================================================
 
   /**
-   * Process a single loop and generate insight
+   * Research insights for a life thread
    */
-  async processLoop(loop, userContext) {
-    const strategy = await this.determineStrategy(loop);
+  async doThreadResearch(thread, userContext) {
+    console.log(`🔍 [NightOwl] Researching thread: "${thread.title}"`);
 
-    switch (strategy) {
-      case 'research':
-        return await this.doResearch(loop, userContext);
-      case 'decision':
-        return await this.analyzeDecision(loop, userContext);
-      case 'preparation':
-        return await this.prepareApproach(loop, userContext);
-      default:
-        return await this.thinkThrough(loop, userContext);
-    }
-  }
+    const relatedContext = await this.getRelatedEntitiesContext(thread.relatedEntities || [], userContext);
+    const userPrefs = this.buildUserPreferencesContext(userContext);
 
-  /**
-   * Determine what kind of work this loop needs using LLM
-   */
-  async determineStrategy(loop) {
-    // Quick heuristic first for obvious cases
-    if (loop.loopType === 'decision') return 'decision';
-    if (loop.isMilestone) return 'milestone';
+    const systemPrompt = `You are Night Owl, a thoughtful AI that helps the user navigate their ongoing life situations.
+
+The user has a life thread they're tracking:
+THREAD: "${thread.title}"
+CATEGORY: ${thread.category}
+STATUS: ${thread.status}
+CONTEXT: ${thread.currentContext || 'No additional context'}
+EMOTIONAL WEIGHT: ${thread.emotionalWeight}/10
+${thread.nextMilestone ? `UPCOMING: ${thread.nextMilestone.description}` : ''}
+${thread.userGuidance?.length ? `USER GUIDANCE: ${thread.userGuidance.join('; ')}` : ''}
+
+Your job is to:
+1. Research relevant information that could help them
+2. Find perspectives or insights they might not have considered
+3. Provide actionable suggestions
+
+Be warm, supportive, and specific to THEIR situation. Use web search if helpful.
+Always respect any user guidance about how to handle this situation.`;
+
+    const userPrompt = `${relatedContext}
+${userPrefs}
+
+Research this life thread and provide helpful insights. Focus on what's most useful for their current status.`;
 
     try {
       const response = await this.anthropic.messages.create({
         model: 'claude-sonnet-4-20250514',
-        max_tokens: 50,
-        messages: [{
-          role: 'user',
-          content: `Classify this open loop into ONE category:
-
-LOOP: "${loop.title}"
-${loop.description ? `Details: ${loop.description}` : ''}
-Type: ${loop.loopType}
-
-Categories:
-- research: Needs information gathering, exploring options, planning trips/activities
-- decision: Needs to weigh options and make a choice
-- preparation: Needs to prepare for a conversation, meeting, or interaction
-- breakdown: Too vague, needs to be broken into concrete steps
-- general: Just needs a fresh perspective or next step
-
-Reply with ONLY the category name, nothing else.`
-        }],
-        system: 'Classify the loop into exactly one category. Reply with only the category name.'
+        max_tokens: 2000,
+        tools: [WEB_SEARCH_TOOL],
+        messages: [{ role: 'user', content: userPrompt }],
+        system: systemPrompt
       });
 
-      const category = response.content[0]?.text?.trim().toLowerCase();
-      const validCategories = ['research', 'decision', 'preparation', 'breakdown', 'general'];
+      const { text, sources } = this.extractResponseContent(response);
 
-      return validCategories.includes(category) ? category : 'general';
+      return {
+        id: this.generateId('thread_insight'),
+        threadId: thread.id,
+        threadTitle: thread.title,
+        insightType: 'research',
+        content: text,
+        conversationHook: this.generateThreadHook(thread, 'research'),
+        sources,
+        createdAt: Date.now(),
+        status: 'pending'
+      };
 
     } catch (error) {
-      console.warn('⚠️ [NightOwl] Strategy classification failed, defaulting to general');
-      return 'general';
+      console.error(`❌ [NightOwl] Thread research failed:`, error.message);
+      return null;
     }
+  }
+
+  /**
+   * Help with a decision-related thread
+   */
+  async analyzeThreadDecision(thread, userContext) {
+    console.log(`🤔 [NightOwl] Analyzing decision for thread: "${thread.title}"`);
+
+    const relatedContext = await this.getRelatedEntitiesContext(thread.relatedEntities || [], userContext);
+    const patternsContext = this.buildPatternsContext(userContext);
+
+    const systemPrompt = `You are Night Owl, helping the user think through a decision.
+
+SITUATION: "${thread.title}"
+CATEGORY: ${thread.category}
+CURRENT STATE: ${thread.status}
+CONTEXT: ${thread.currentContext || 'No additional context'}
+EMOTIONAL WEIGHT: ${thread.emotionalWeight}/10
+${thread.userGuidance?.length ? `USER GUIDANCE: ${thread.userGuidance.join('; ')}` : ''}
+
+Help them think through this decision by:
+1. Identifying what they truly value in this situation
+2. Weighing factors based on their patterns and history
+3. Offering a perspective they might not have considered
+4. NOT making the decision for them
+
+Be thoughtful and personalized. Reference their patterns and known preferences.
+Respect any guidance they've given about how to approach this.`;
+
+    const userPrompt = `${relatedContext}
+${patternsContext}
+
+Help them think through this decision. Be warm and insightful.`;
+
+    try {
+      const response = await this.anthropic.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 2000,
+        messages: [{ role: 'user', content: userPrompt }],
+        system: systemPrompt
+      });
+
+      const { text } = this.extractResponseContent(response);
+
+      return {
+        id: this.generateId('thread_insight'),
+        threadId: thread.id,
+        threadTitle: thread.title,
+        insightType: 'decision_analysis',
+        content: text,
+        conversationHook: this.generateThreadHook(thread, 'decision'),
+        sources: [],
+        createdAt: Date.now(),
+        status: 'pending'
+      };
+
+    } catch (error) {
+      console.error(`❌ [NightOwl] Thread decision analysis failed:`, error.message);
+      return null;
+    }
+  }
+
+  /**
+   * Prepare for an upcoming interaction/milestone
+   */
+  async prepareThreadApproach(thread, userContext) {
+    console.log(`🎯 [NightOwl] Preparing approach for thread: "${thread.title}"`);
+
+    const relatedContext = await this.getRelatedEntitiesContext(thread.relatedEntities || [], userContext);
+
+    const milestone = thread.nextMilestone;
+    const daysUntil = milestone?.date 
+      ? Math.ceil((milestone.date - Date.now()) / (24 * 60 * 60 * 1000))
+      : null;
+
+    const systemPrompt = `You are Night Owl, helping the user prepare for something important.
+
+SITUATION: "${thread.title}"
+CATEGORY: ${thread.category}
+${milestone ? `UPCOMING: ${milestone.description} ${daysUntil !== null ? `(${daysUntil} days away)` : ''}` : ''}
+CONTEXT: ${thread.currentContext || 'No additional context'}
+${thread.userGuidance?.length ? `USER GUIDANCE: ${thread.userGuidance.join('; ')}` : ''}
+
+Help them prepare by:
+1. Anticipating what might come up
+2. Suggesting approaches based on their style
+3. Helping them feel more confident
+4. Identifying things to think about beforehand
+
+Be supportive and practical. Make them feel prepared, not anxious.`;
+
+    const userPrompt = `${relatedContext}
+
+Help them prepare for this. Focus on practical preparation and emotional readiness.`;
+
+    try {
+      const response = await this.anthropic.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 2000,
+        messages: [{ role: 'user', content: userPrompt }],
+        system: systemPrompt
+      });
+
+      const { text } = this.extractResponseContent(response);
+
+      return {
+        id: this.generateId('thread_insight'),
+        threadId: thread.id,
+        threadTitle: thread.title,
+        insightType: 'preparation',
+        content: text,
+        conversationHook: this.generateThreadHook(thread, 'preparation'),
+        sources: [],
+        createdAt: Date.now(),
+        status: 'pending'
+      };
+
+    } catch (error) {
+      console.error(`❌ [NightOwl] Thread preparation failed:`, error.message);
+      return null;
+    }
+  }
+
+  /**
+   * Reflection on a thread (especially for 'waiting' category)
+   */
+  async reflectOnThread(thread, userContext) {
+    console.log(`💭 [NightOwl] Reflecting on thread: "${thread.title}"`);
+
+    const patternsContext = this.buildPatternsContext(userContext);
+
+    const systemPrompt = `You are Night Owl, offering thoughtful reflection on something the user is navigating.
+
+SITUATION: "${thread.title}"
+CATEGORY: ${thread.category}
+STATUS: ${thread.status}
+CONTEXT: ${thread.currentContext || 'No additional context'}
+EMOTIONAL WEIGHT: ${thread.emotionalWeight}/10
+${thread.userGuidance?.length ? `USER GUIDANCE: ${thread.userGuidance.join('; ')}` : ''}
+
+${thread.category === 'waiting' ? 'They are waiting to hear back on something. Help them process the uncertainty.' : ''}
+
+Offer:
+1. A fresh perspective on where they are
+2. Validation of their feelings
+3. A gentle reframe if helpful
+4. Something to consider that might bring peace or clarity
+
+Be warm, not clinical. This is reflection, not problem-solving.`;
+
+    const userPrompt = `${patternsContext}
+
+Offer a thoughtful reflection. Be personal and warm.`;
+
+    try {
+      const response = await this.anthropic.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1500,
+        messages: [{ role: 'user', content: userPrompt }],
+        system: systemPrompt
+      });
+
+      const { text } = this.extractResponseContent(response);
+
+      return {
+        id: this.generateId('thread_insight'),
+        threadId: thread.id,
+        threadTitle: thread.title,
+        insightType: 'reflection',
+        content: text,
+        conversationHook: this.generateThreadHook(thread, 'reflection'),
+        sources: [],
+        createdAt: Date.now(),
+        status: 'pending'
+      };
+
+    } catch (error) {
+      console.error(`❌ [NightOwl] Thread reflection failed:`, error.message);
+      return null;
+    }
+  }
+
+  /**
+   * General think-through for a thread
+   */
+  async thinkThroughThread(thread, userContext) {
+    console.log(`💡 [NightOwl] Thinking through thread: "${thread.title}"`);
+
+    const relatedContext = await this.getRelatedEntitiesContext(thread.relatedEntities || [], userContext);
+    const patternsContext = this.buildPatternsContext(userContext);
+
+    const systemPrompt = `You are Night Owl, offering overnight perspective on something the user is tracking.
+
+SITUATION: "${thread.title}"
+CATEGORY: ${thread.category}
+STATUS: ${thread.status}
+CONTEXT: ${thread.currentContext || 'No additional context'}
+${thread.userGuidance?.length ? `USER GUIDANCE: ${thread.userGuidance.join('; ')}` : ''}
+
+Offer something helpful:
+- A perspective they might not have considered
+- A connection to their patterns or history
+- A practical next step
+- An encouraging observation
+
+Be concise but meaningful. This will be delivered in conversation.`;
+
+    const userPrompt = `${relatedContext}
+${patternsContext}
+
+Think through this situation and offer something useful.`;
+
+    try {
+      const response = await this.anthropic.messages.create({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1500,
+        messages: [{ role: 'user', content: userPrompt }],
+        system: systemPrompt
+      });
+
+      const { text } = this.extractResponseContent(response);
+
+      return {
+        id: this.generateId('thread_insight'),
+        threadId: thread.id,
+        threadTitle: thread.title,
+        insightType: 'perspective',
+        content: text,
+        conversationHook: this.generateThreadHook(thread, 'perspective'),
+        sources: [],
+        createdAt: Date.now(),
+        status: 'pending'
+      };
+
+    } catch (error) {
+      console.error(`❌ [NightOwl] Thread thinking failed:`, error.message);
+      return null;
+    }
+  }
+
+  /**
+   * Generate a natural conversation hook for delivering a thread insight
+   */
+  generateThreadHook(thread, insightType) {
+    const hooks = {
+      research: [
+        `I did some thinking about ${thread.title}...`,
+        `Been mulling over the ${thread.title} situation...`,
+        `I looked into some things about ${thread.title}...`
+      ],
+      decision: [
+        `I thought about that decision you're weighing...`,
+        `About ${thread.title} - I had some thoughts...`,
+        `I've been thinking about your options with ${thread.title}...`
+      ],
+      preparation: [
+        `Wanted to help you prepare for ${thread.nextMilestone?.description || 'what\'s coming'}...`,
+        `Thinking about your upcoming ${thread.title} situation...`,
+        `I thought of some things that might help with ${thread.title}...`
+      ],
+      reflection: [
+        `I was reflecting on the ${thread.title} situation...`,
+        `About ${thread.title} - had a thought...`,
+        `Something occurred to me about ${thread.title}...`
+      ],
+      perspective: [
+        `I had a thought about ${thread.title}...`,
+        `About that ${thread.title} situation...`,
+        `Something about ${thread.title} came to mind...`
+      ]
+    };
+
+    const typeHooks = hooks[insightType] || hooks.perspective;
+    return typeHooks[Math.floor(Math.random() * typeHooks.length)];
+  }
+
+  /**
+   * Build patterns context for prompts
+   */
+  buildPatternsContext(userContext) {
+    if (!userContext.patterns?.length) return '';
+
+    const patterns = userContext.patterns.slice(0, 5).map(p => `- ${p.claim}`).join('\n');
+    return `\nKNOWN PATTERNS ABOUT THEM:\n${patterns}`;
   }
 
   // ============================================================================
   // ITERATIVE RESEARCH SYSTEM
   // ============================================================================
 
-  /**
-   * Main entry point for research -  iterative
-   */
   /**
    * Research depth configurations
    * - quick: Fast surface-level research (~30s, ~$0.10)
@@ -1498,7 +2052,7 @@ Respond in this exact JSON format:
         const response = await this.anthropic.messages.create({
           model: 'claude-sonnet-4-20250514',
           max_tokens: 1500,
-          tools: [{ type: 'web_search_20250305' }],
+          tools: [WEB_SEARCH_TOOL],
           messages: [{
             role: 'user',
             content: `Research this specific question thoroughly:
@@ -1681,7 +2235,7 @@ Please research this thoroughly and provide practical, personalized findings. Us
       const response = await this.anthropic.messages.create({
         model: 'claude-sonnet-4-20250514',
         max_tokens: 2000,
-        tools: [{ type: 'web_search_20250305' }],
+        tools: [WEB_SEARCH_TOOL],
         messages: [{ role: 'user', content: userPrompt }],
         system: systemPrompt
       });
@@ -1745,7 +2299,7 @@ Please provide 2-3 different perspectives on this decision, highlight key trade-
       const response = await this.anthropic.messages.create({
         model: 'claude-sonnet-4-20250514',
         max_tokens: 1500,
-        tools: [{ type: 'web_search_20250305' }], // In case we need to research aspects
+        tools: [WEB_SEARCH_TOOL], // In case we need to research aspects
         messages: [
           { role: 'user', content: userPrompt }
         ],
@@ -2039,7 +2593,7 @@ Please offer a helpful perspective or suggest a concrete next step they could ta
     const birthdayInsight = await this.checkUpcomingBirthdays(userContext, nextWeek);
     if (birthdayInsight) insights.push(birthdayInsight);
 
-    // Check for upcoming trips (from open loops or calendar)
+    // Check for upcoming trips (from life threads or calendar)
     const tripInsight = await this.prepareForTrips(userContext, calendarEvents);
     if (tripInsight) insights.push(tripInsight);
 
@@ -2068,8 +2622,8 @@ Please offer a helpful perspective or suggest a concrete next step they could ta
 Here's what we know about ${personNames[0]}:
 ${personContext}
 
-Recent open loops involving them:
-${await this.getLoopsInvolvingPerson(personNames[0])}
+Recent life threads involving them:
+${await this.getThreadsInvolvingPerson(personNames[0])}
 
 Please prepare a brief context summary: who this person is, recent context, any open items with them, and anything useful to remember going in.`
         }],
@@ -2141,7 +2695,7 @@ Please prepare a brief context summary: who this person is, recent context, any 
       const response = await this.anthropic.messages.create({
         model: 'claude-sonnet-4-20250514',
         max_tokens: 800,
-        tools: [{ type: 'web_search_20250305' }],
+        tools: [WEB_SEARCH_TOOL],
         messages: [{
           role: 'user',
           content: `${person.name}'s birthday is coming up. They are the user's ${person.relationship || 'friend'}.
@@ -2182,19 +2736,20 @@ Please suggest 2-3 thoughtful gift ideas or ways to celebrate, based on what we 
   }
 
   async prepareForTrips(userContext, calendarEvents) {
-    // Look for trip-related open loops
-    const loops = await this.crsService.loadExistingSystemFiles('open_loops');
-    const tripLoops = loops.filter(l =>
-      l.status === 'open' &&
-      (l.title.toLowerCase().includes('trip') ||
-        l.title.toLowerCase().includes('travel') ||
-        l.title.toLowerCase().includes('vacation') ||
-        l.title.toLowerCase().includes('visit'))
+    // Look for trip-related life threads
+    const threads = await this.crsService.loadExistingSystemFiles('life_threads');
+    const tripThreads = (threads || []).filter(t =>
+      !t.resolved &&
+      (t.category === 'logistics' ||
+        t.title.toLowerCase().includes('trip') ||
+        t.title.toLowerCase().includes('travel') ||
+        t.title.toLowerCase().includes('vacation') ||
+        t.title.toLowerCase().includes('visit'))
     );
 
-    if (tripLoops.length === 0) return null;
+    if (tripThreads.length === 0) return null;
 
-    const trip = tripLoops[0];
+    const trip = tripThreads[0];
 
     // Check if trip is within next 2 weeks (would need actual date parsing)
     console.log(`✈️ [NightOwl] Preparing for trip: "${trip.title}"`);
@@ -2205,7 +2760,7 @@ Please suggest 2-3 thoughtful gift ideas or ways to celebrate, based on what we 
       const response = await this.anthropic.messages.create({
         model: 'claude-sonnet-4-20250514',
         max_tokens: 1200,
-        tools: [{ type: 'web_search_20250305' }],
+        tools: [WEB_SEARCH_TOOL],
         messages: [{
           role: 'user',
           content: `Help prepare for this upcoming trip:
@@ -2339,7 +2894,7 @@ Please explain this pattern in a warm, insightful way. What might be driving it?
     const insights = [];
 
     const facts = userContext.relevantFacts || [];
-    const loops = await this.crsService.loadExistingSystemFiles('open_loops');
+    const threads = await this.crsService.loadExistingSystemFiles('life_threads');
 
     // Look for recent events that warrant follow-up
     const recentEventFacts = facts.filter(f => {
@@ -2353,14 +2908,14 @@ Please explain this pattern in a warm, insightful way. What might be driving it?
     });
 
     for (const fact of recentEventFacts.slice(0, 1)) { // Max 1 reminder
-      // Check if there's already an open loop for follow-up
-      const hasLoop = loops.some(l =>
-        l.status === 'open' &&
-        l.title.toLowerCase().includes('thank') ||
-        l.title.toLowerCase().includes('follow up')
+      // Check if there's already an active thread for follow-up
+      const hasThread = (threads || []).some(t =>
+        !t.resolved &&
+        (t.title.toLowerCase().includes('thank') ||
+        t.title.toLowerCase().includes('follow up'))
       );
 
-      if (hasLoop) continue;
+      if (hasThread) continue;
 
       // Generate contextual reminder
       try {
@@ -2414,33 +2969,32 @@ If yes, suggest what they should do. If no follow-up is needed, say so briefly.`
     console.log('📊 [NightOwl] Checking accountability...');
     const insights = [];
 
-    const loops = await this.crsService.loadExistingSystemFiles('open_loops');
+    const threads = await this.crsService.loadExistingSystemFiles('life_threads');
     const facts = userContext.relevantFacts || [];
 
-    // Find commitments with deadlines that are approaching or passed
-    const commitments = loops.filter(l =>
-      l.status === 'open' &&
-      (l.loopType === 'commitment' || l.loopType === 'decision') &&
-      l.dueDate
+    // Find threads with upcoming milestones
+    const commitments = (threads || []).filter(t =>
+      !t.resolved &&
+      t.nextMilestone?.date
     );
 
     const now = Date.now();
-    const overdue = commitments.filter(c => new Date(c.dueDate).getTime() < now);
+    const overdue = commitments.filter(c => c.nextMilestone?.date < now);
     const upcoming = commitments.filter(c => {
-      const due = new Date(c.dueDate).getTime();
+      const due = c.nextMilestone?.date;
       return due >= now && due < now + 3 * 24 * 60 * 60 * 1000; // Within 3 days
     });
 
-    // Find stalled projects (open loops with no recent activity)
-    const stalledLoops = loops.filter(l => {
-      if (l.status !== 'open') return false;
-      if (l.loopType !== 'task' && l.loopType !== 'plan') return false;
-      const lastUpdate = l.updatedAt || l.createdAt;
+    // Find stalled threads (no recent activity)
+    const stalledThreads = (threads || []).filter(t => {
+      if (t.resolved) return false;
+      if (!['career', 'goal', 'creative'].includes(t.category)) return false;
+      const lastUpdate = t.lastUpdate || t.createdAt;
       const daysSinceUpdate = (now - lastUpdate) / (24 * 60 * 60 * 1000);
       return daysSinceUpdate > 7; // No activity in 7+ days
     });
 
-    if (overdue.length > 0 || upcoming.length > 0 || stalledLoops.length > 0) {
+    if (overdue.length > 0 || upcoming.length > 0 || stalledThreads.length > 0) {
       try {
         const response = await this.anthropic.messages.create({
           model: 'claude-sonnet-4-20250514',
@@ -2450,13 +3004,13 @@ If yes, suggest what they should do. If no follow-up is needed, say so briefly.`
             content: `Here's the user's accountability status:
 
 OVERDUE (need attention):
-${overdue.map(c => `- "${c.title}" (due: ${c.dueDate})`).join('\n') || 'None'}
+${overdue.map(c => `- "${c.title}" (milestone: ${new Date(c.nextMilestone?.date).toLocaleDateString()})`).join('\n') || 'None'}
 
 UPCOMING (within 3 days):
-${upcoming.map(c => `- "${c.title}" (due: ${c.dueDate})`).join('\n') || 'None'}
+${upcoming.map(c => `- "${c.title}" (milestone: ${new Date(c.nextMilestone?.date).toLocaleDateString()})`).join('\n') || 'None'}
 
 STALLED (no progress in 7+ days):
-${stalledLoops.map(l => `- "${l.title}" (${Math.floor((now - (l.updatedAt || l.createdAt)) / (24 * 60 * 60 * 1000))} days)`).join('\n') || 'None'}
+${stalledThreads.map(t => `- "${t.title}" (${Math.floor((now - (t.lastUpdate || t.createdAt)) / (24 * 60 * 60 * 1000))} days)`).join('\n') || 'None'}
 
 You are Ethan's RELENTLESS accountability partner. He's building toward being an Oscar-winning actor - every day matters.
 
@@ -2689,11 +3243,12 @@ Only share if you find meaningful correlations.`
     }
 
     // Get goals to connect learning to
-    const loops = await this.crsService.loadExistingSystemFiles('open_loops');
-    const goals = loops.filter(l =>
-      l.loopType === 'plan' ||
-      l.title.toLowerCase().includes('goal') ||
-      l.title.toLowerCase().includes('learn')
+    const threads = await this.crsService.loadExistingSystemFiles('life_threads');
+    const goals = (threads || []).filter(t =>
+      !t.resolved &&
+      (t.category === 'goal' ||
+        t.title.toLowerCase().includes('goal') ||
+        t.title.toLowerCase().includes('learn'))
     );
 
     try {
@@ -2749,18 +3304,21 @@ Be insightful and help them see the bigger picture of their learning journey.`
     const insights = [];
 
     try {
-      const loops = await this.crsService.loadExistingSystemFiles('open_loops');
+      const threads = await this.crsService.loadExistingSystemFiles('life_threads');
 
       // PRIORITIZE MILESTONES FIRST
-      const milestoneLoops = loops.filter(l =>
-        l.status === 'open' && l.isMilestone
-      ).sort((a, b) => (a.daysUntil || 999) - (b.daysUntil || 999));
+      const milestoneThreads = (threads || []).filter(t =>
+        !t.resolved && t.nextMilestone
+      ).sort((a, b) => {
+        const aTime = a.nextMilestone?.date || Infinity;
+        const bTime = b.nextMilestone?.date || Infinity;
+        return aTime - bTime;
+      });
 
-      const planLoops = loops.filter(l =>
-        l.status === 'open' &&
-        l.loopType === 'plan' &&
-        l.priority <= 2 &&
-        !l.isMilestone
+      const planThreads = (threads || []).filter(t =>
+        !t.resolved &&
+        t.category === 'goal' &&
+        t.emotionalWeight >= 5
       );
 
       // Process milestones first (up to 2)
@@ -2849,7 +3407,7 @@ Be warm and recognize this matters to them.`;
       const response = await this.anthropic.messages.create({
         model: 'claude-sonnet-4-20250514',
         max_tokens: 1500,
-        tools: [{ type: 'web_search_20250305' }],
+        tools: [WEB_SEARCH_TOOL],
         messages: [{ role: 'user', content: userPrompt }],
         system: systemPrompt
       });
@@ -3087,7 +3645,7 @@ Respond in JSON:
     const response = await this.anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 1500,
-      tools: [{ type: 'web_search_20250305' }],
+      tools: [WEB_SEARCH_TOOL],
       messages: [{
         role: 'user',
         content: `Diagnose the key factors for this plan and generate research questions.
@@ -3276,7 +3834,7 @@ Write conversationally - this will be delivered in chat. Don't use generic heade
     const response = await this.anthropic.messages.create({
       model: 'claude-sonnet-4-20250514',
       max_tokens: 2000,
-      tools: [{ type: 'web_search_20250305' }],
+      tools: [WEB_SEARCH_TOOL],
       messages: [{
         role: 'user',
         content: `Research and create a plan for: ${plan.title}
@@ -3823,15 +4381,15 @@ Return ONLY the opener, nothing else.`
     return context;
   }
 
-  async getLoopsInvolvingPerson(name) {
-    const loops = await this.crsService.loadExistingSystemFiles('open_loops');
-    const involving = loops.filter(l =>
-      l.status === 'open' &&
-      l.title.toLowerCase().includes(name.toLowerCase())
+  async getThreadsInvolvingPerson(name) {
+    const threads = await this.crsService.loadExistingSystemFiles('life_threads');
+    const involving = (threads || []).filter(t =>
+      !t.resolved &&
+      t.title.toLowerCase().includes(name.toLowerCase())
     );
 
     if (involving.length === 0) return 'None';
-    return involving.map(l => `- ${l.title}`).join('\n');
+    return involving.map(t => `- ${t.title}`).join('\n');
   }
 
   buildUserPreferencesContext(userContext) {

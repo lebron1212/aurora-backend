@@ -557,6 +557,199 @@ app.get('/system/status', (req, res) => {
   }
 });
 
+// ============================================================================
+// NIGHT OWL QUEUE MANAGEMENT ENDPOINTS
+// ============================================================================
+
+// Get Night Owl queue status
+app.get('/api/nightowl/queue', async (req, res) => {
+  try {
+    const forceRefresh = req.query.refresh === 'true';
+    console.log(`🦉 [NightOwl] Getting queue status...${forceRefresh ? ' (force refresh)' : ''}`);
+    const status = await nightOwl.getQueueStatus(forceRefresh);
+    res.json(status);
+  } catch (error) {
+    console.error('❌ [NightOwl] Failed to get queue status:', error);
+    res.status(500).json({ error: 'Failed to get queue status' });
+  }
+});
+
+// Add item to queue
+app.post('/api/nightowl/queue', async (req, res) => {
+  try {
+    const { request, type, context, priority, dataSources, dateRange } = req.body;
+    
+    if (!request) {
+      return res.status(400).json({ error: 'Request is required' });
+    }
+    
+    console.log(`🦉 [NightOwl] Adding to queue: "${request.slice(0, 50)}..."`);
+    
+    const queuedItem = await nightOwl.queueRequest({
+      request,
+      type: type || 'analyze',
+      context,
+      priority: priority || 'normal',
+      dataSources: dataSources || ['all'],
+      dateRange
+    });
+    
+    res.json({ success: true, item: queuedItem });
+  } catch (error) {
+    console.error('❌ [NightOwl] Failed to add to queue:', error);
+    res.status(500).json({ error: 'Failed to add item to queue' });
+  }
+});
+
+// Get single queue item
+app.get('/api/nightowl/queue/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    console.log(`🦉 [NightOwl] Getting queue item: ${id}`);
+    
+    const item = await nightOwl.getQueueItem(id);
+    
+    if (!item) {
+      return res.status(404).json({ error: 'Queue item not found' });
+    }
+    
+    res.json(item);
+  } catch (error) {
+    console.error('❌ [NightOwl] Failed to get queue item:', error);
+    res.status(500).json({ error: 'Failed to get queue item' });
+  }
+});
+
+// Update queue item
+app.put('/api/nightowl/queue/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    const updates = req.body;
+    
+    console.log(`🦉 [NightOwl] Updating queue item: ${id}`);
+    
+    const updated = await nightOwl.updateQueueItem(id, updates);
+    
+    if (!updated) {
+      return res.status(400).json({ 
+        error: 'Cannot update queue item. Item may not exist or is not pending.' 
+      });
+    }
+    
+    res.json({ success: true, item: updated });
+  } catch (error) {
+    console.error('❌ [NightOwl] Failed to update queue item:', error);
+    res.status(500).json({ error: 'Failed to update queue item' });
+  }
+});
+
+// Remove queue item
+app.delete('/api/nightowl/queue/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    console.log(`🦉 [NightOwl] Removing queue item: ${id}`);
+    
+    const removed = await nightOwl.removeQueueItem(id);
+    
+    if (!removed) {
+      return res.status(404).json({ error: 'Queue item not found' });
+    }
+    
+    res.json({ success: true, message: 'Queue item removed' });
+  } catch (error) {
+    console.error('❌ [NightOwl] Failed to remove queue item:', error);
+    res.status(500).json({ error: 'Failed to remove queue item' });
+  }
+});
+
+// Clear all pending queue items
+app.delete('/api/nightowl/queue', async (req, res) => {
+  try {
+    console.log('🦉 [NightOwl] Clearing pending queue...');
+    
+    const clearedCount = await nightOwl.clearPendingQueue();
+    
+    res.json({ success: true, clearedCount, message: `Cleared ${clearedCount} pending items` });
+  } catch (error) {
+    console.error('❌ [NightOwl] Failed to clear queue:', error);
+    res.status(500).json({ error: 'Failed to clear queue' });
+  }
+});
+
+// Reorder queue items
+app.post('/api/nightowl/queue/reorder', async (req, res) => {
+  try {
+    const { orderedIds } = req.body;
+    
+    if (!Array.isArray(orderedIds)) {
+      return res.status(400).json({ error: 'orderedIds must be an array of request IDs' });
+    }
+    
+    console.log(`🦉 [NightOwl] Reordering ${orderedIds.length} queue items...`);
+    
+    const reordered = await nightOwl.reorderQueue(orderedIds);
+    
+    res.json({ success: true, items: reordered });
+  } catch (error) {
+    console.error('❌ [NightOwl] Failed to reorder queue:', error);
+    res.status(500).json({ error: 'Failed to reorder queue' });
+  }
+});
+
+// Get Night Owl settings
+app.get('/api/nightowl/settings', async (req, res) => {
+  try {
+    console.log('🦉 [NightOwl] Getting settings...');
+    const settings = await nightOwl.loadSettings();
+    res.json(settings);
+  } catch (error) {
+    console.error('❌ [NightOwl] Failed to get settings:', error);
+    res.status(500).json({ error: 'Failed to get settings' });
+  }
+});
+
+// Update Night Owl settings
+app.put('/api/nightowl/settings', async (req, res) => {
+  try {
+    const updates = req.body;
+    console.log('🦉 [NightOwl] Updating settings:', updates);
+    
+    const settings = await nightOwl.saveSettings(updates);
+    res.json({ success: true, settings });
+  } catch (error) {
+    console.error('❌ [NightOwl] Failed to update settings:', error);
+    res.status(500).json({ error: 'Failed to update settings' });
+  }
+});
+
+// Trigger Night Owl processing manually
+app.post('/api/nightowl/process', async (req, res) => {
+  try {
+    const { queuedOnly } = req.body;
+    
+    console.log(`🦉 [NightOwl] Manual processing triggered (queuedOnly: ${queuedOnly})...`);
+    
+    // Start processing in background
+    const processPromise = queuedOnly 
+      ? nightOwl.processQueuedOnly() 
+      : nightOwl.processAll();
+    
+    processPromise.then(result => {
+      console.log(`🦉 [NightOwl] Processing complete:`, result);
+    }).catch(error => {
+      console.error('❌ [NightOwl] Processing failed:', error);
+    });
+    
+    res.json({ 
+      success: true, 
+      message: `Night Owl ${queuedOnly ? 'queued-only' : 'full'} processing started` 
+    });
+  } catch (error) {
+    console.error('❌ [NightOwl] Failed to trigger processing:', error);
+    res.status(500).json({ error: 'Failed to trigger processing' });
+  }
+});
+
 // Debug endpoint to check what's actually in journals.json
 app.get('/debug/journals', async (req, res) => {
   try {
@@ -711,11 +904,23 @@ app.delete('/nightowl/insights', async (req, res) => {
   }
 });
 
-// Manual Night Owl trigger
+// Manual Night Owl trigger - full processing (2 AM batch style)
 app.post('/nightowl/trigger', async (req, res) => {
   try {
-    console.log('🦉 [NIGHT OWL] Manual trigger...');
-    const result = await nightOwl.process();
+    console.log('🦉 [NIGHT OWL] Manual trigger (full processing)...');
+    const result = await nightOwl.processAll();
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Process queued requests only - NO autonomous processing
+// Use this for on-demand/immediate research processing
+app.post('/nightowl/process-queued', async (req, res) => {
+  try {
+    console.log('🦉 [NIGHT OWL] Processing queued requests only (on-demand)...');
+    const result = await nightOwl.processQueuedOnly();
     res.json(result);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -884,6 +1089,59 @@ app.post('/nightowl/queue', async (req, res) => {
   } catch (error) {
     console.error('❌ [NIGHT OWL] Failed to queue request:', error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Remove a specific queue item
+app.delete('/nightowl/queue/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    console.log(`🦉 [NIGHT OWL] Removing queue item: ${id}...`);
+    
+    const removed = await nightOwl.removeQueueItem(id);
+    
+    if (!removed) {
+      return res.status(404).json({ error: 'Queue item not found' });
+    }
+    
+    res.json({ success: true, message: 'Queue item removed' });
+  } catch (error) {
+    console.error('❌ [NIGHT OWL] Failed to remove queue item:', error);
+    res.status(500).json({ error: 'Failed to remove queue item' });
+  }
+});
+
+// Clear all pending queue items
+app.delete('/nightowl/queue', async (req, res) => {
+  try {
+    console.log('🦉 [NIGHT OWL] Clearing pending queue...');
+    
+    const clearedCount = await nightOwl.clearPendingQueue();
+    
+    res.json({ success: true, clearedCount, message: `Cleared ${clearedCount} pending items` });
+  } catch (error) {
+    console.error('❌ [NIGHT OWL] Failed to clear queue:', error);
+    res.status(500).json({ error: 'Failed to clear queue' });
+  }
+});
+
+// Reorder queue items
+app.post('/nightowl/queue/reorder', async (req, res) => {
+  try {
+    const { orderedIds } = req.body;
+    
+    if (!Array.isArray(orderedIds)) {
+      return res.status(400).json({ error: 'orderedIds must be an array of request IDs' });
+    }
+    
+    console.log(`🦉 [NIGHT OWL] Reordering ${orderedIds.length} queue items...`);
+    
+    const reordered = await nightOwl.reorderQueue(orderedIds);
+    
+    res.json({ success: true, items: reordered });
+  } catch (error) {
+    console.error('❌ [NIGHT OWL] Failed to reorder queue:', error);
+    res.status(500).json({ error: 'Failed to reorder queue' });
   }
 });
 
@@ -3106,6 +3364,17 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`   GET  /processing-stats - Get nightly processing statistics`);
   console.log(`   GET  /processing-results - Get processing results for frontend`);
   console.log(`   GET  /health - Check server status`);
+  console.log('🦉 Night Owl Queue Endpoints:');
+  console.log(`   GET  /api/nightowl/queue - Get queue status`);
+  console.log(`   POST /api/nightowl/queue - Add item to queue`);
+  console.log(`   GET  /api/nightowl/queue/:id - Get single queue item`);
+  console.log(`   PUT  /api/nightowl/queue/:id - Update queue item`);
+  console.log(`   DELETE /api/nightowl/queue/:id - Remove queue item`);
+  console.log(`   DELETE /api/nightowl/queue - Clear all pending items`);
+  console.log(`   POST /api/nightowl/queue/reorder - Reorder queue items`);
+  console.log(`   GET  /api/nightowl/settings - Get Night Owl settings`);
+  console.log(`   PUT  /api/nightowl/settings - Update settings`);
+  console.log(`   POST /api/nightowl/process - Trigger processing`);
   
   // Note: Old nightly processing disabled - CRS handles this now
   // scheduleNightlyProcessing(); // DISABLED - using HorizonCRSService instead
