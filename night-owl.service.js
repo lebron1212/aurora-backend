@@ -133,6 +133,10 @@ class NightOwlService {
     this.maxLoopsPerRun = config.maxLoopsPerRun || 3;
     this.minPriority = config.minPriority || 2; // Process priority 1 and 2
     this.settings = DEFAULT_SETTINGS;
+    
+    // In-memory queue cache to avoid Supabase sync latency issues
+    this.queueCache = null;
+    this.queueCacheTime = 0;
 
     if (!this.anthropicApiKey) {
       console.warn('⚠️ [NightOwl] ANTHROPIC_API_KEY not set. Night Owl will be disabled.');
@@ -598,8 +602,8 @@ class NightOwlService {
     const insights = [];
 
     try {
-      // Read queued requests
-      const queueFile = await this.crsService.readFile('system/nightowl/queue.json').catch(() => null);
+      // Read queued requests (use cache)
+      const queueFile = await this.getQueueFile();
       const queue = queueFile?.requests?.filter(r => r.status === 'pending') || [];
 
       if (queue.length === 0) {
@@ -639,11 +643,14 @@ class NightOwlService {
         }
       }
 
-      // Save updated queue
-      await this.crsService.writeFile('system/nightowl/queue.json', {
+      // Save updated queue and update cache
+      const updatedQueue = {
         requests: queueFile?.requests || queue,
         lastProcessed: Date.now()
-      });
+      };
+      this.queueCache = updatedQueue;
+      this.queueCacheTime = Date.now();
+      await this.crsService.writeFile('system/nightowl/queue.json', updatedQueue);
 
     } catch (error) {
       console.error('❌ [NightOwl] Queue processing failed:', error.message);
@@ -842,16 +849,19 @@ Please provide your analysis.`;
       delivered: false
     };
 
-    // Load existing queue
-    let queueFile;
-    try {
-      queueFile = await this.crsService.readFile('system/nightowl/queue.json');
-    } catch {
-      queueFile = { requests: [] };
-    }
+    // Load existing queue (use cache if fresh)
+    let queueFile = await this.getQueueFile();
 
     queueFile.requests.push(fullRequest);
+    
+    // Update cache immediately
+    this.queueCache = queueFile;
+    this.queueCacheTime = Date.now();
+    
+    // Write to Supabase (async, don't block)
     await this.crsService.writeFile('system/nightowl/queue.json', queueFile);
+    
+    console.log(`🦉 [NightOwl] Queued request ${fullRequest.id}: "${fullRequest.request?.slice(0, 50)}..."`);
 
     // If autonomous was paused, note that it should resume
     if (this.settings.processQueuedOnly) {
@@ -862,10 +872,32 @@ Please provide your analysis.`;
   }
 
   /**
+   * Get queue file with caching to handle Supabase sync latency
+   */
+  async getQueueFile() {
+    // Use cache if less than 30 seconds old
+    if (this.queueCache && (Date.now() - this.queueCacheTime) < 30000) {
+      console.log('🦉 [NightOwl] Using cached queue');
+      return this.queueCache;
+    }
+    
+    try {
+      const queueFile = await this.crsService.readFile('system/nightowl/queue.json');
+      this.queueCache = queueFile || { requests: [] };
+      this.queueCacheTime = Date.now();
+      return this.queueCache;
+    } catch {
+      this.queueCache = { requests: [] };
+      this.queueCacheTime = Date.now();
+      return this.queueCache;
+    }
+  }
+
+  /**
    * Get queue status
    */
   async getQueueStatus() {
-    const queueFile = await this.crsService.readFile('system/nightowl/queue.json').catch(() => ({ requests: [] }));
+    const queueFile = await this.getQueueFile();
     const pending = queueFile.requests?.filter(r => r.status === 'pending') || [];
     const completed = queueFile.requests?.filter(r => r.status === 'completed') || [];
 
