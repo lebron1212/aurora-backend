@@ -178,18 +178,24 @@ class HorizonCRSService {
     // Ensure system directories exist in storage
     await this.ensureSystemDirectories();
 
+    // DISABLED: Nightly cron job was costing $5-10/night
+    // CRS processing now only runs on manual trigger
     // Start nightly cron job at 2 AM PST (10 AM UTC)
     // Railway servers run in UTC, so we need to adjust: 2 AM PST = 10 AM UTC
+    /*
     cron.schedule('0 10 * * *', async () => {
       const pstTime = new Date().toLocaleString('en-US', { timeZone: 'America/Los_Angeles' });
       console.log(`🌙 [CRS] Starting nightly processing at ${pstTime} PST...`);
       await this.runNightlyProcessing();
     });
+    */
+    console.log('⚠️ [CRS] Automatic nightly processing DISABLED (cost savings)');
+    console.log('⚠️ [CRS] Use /system/process endpoint to trigger manually');
 
     // Optional: Add a manual trigger endpoint for testing
     this.setupManualTrigger();
 
-    console.log('✅ [CRS] Service initialized. Nightly processing scheduled for 2 AM PST (10 AM UTC).');
+    console.log('✅ [CRS] Service initialized. Manual processing only.');
   }
 
   /**

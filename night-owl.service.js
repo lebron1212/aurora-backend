@@ -113,12 +113,12 @@ import Anthropic from '@anthropic-ai/sdk';
 
 const DEFAULT_SETTINGS = {
   enabled: true,
-  autonomousProcessing: true,
-  processQueuedOnly: false,
+  autonomousProcessing: false,  // DISABLED - saves $$$, only process queued research
+  processQueuedOnly: true,       // ENABLED - only user-requested research
   notificationsEnabled: true,
   notificationTiming: 'morning',
   morningHour: 6,
-  maxInsightsPerNight: 10,
+  maxInsightsPerNight: 5,        // Reduced from 10
   lastProcessedAt: null,
   pausedUntil: null
 };
@@ -141,6 +141,11 @@ class NightOwlService {
     // In-memory queue cache to avoid Supabase sync latency issues
     this.queueCache = null;
     this.queueCacheTime = 0;
+    
+    // Processing lock to prevent concurrent research runs (which cost $$$)
+    this.isProcessing = false;
+    this.processingStartTime = null;
+    this.processingLockTimeout = 10 * 60 * 1000; // 10 minutes max lock
 
     if (!this.anthropicApiKey) {
       console.warn('⚠️ [NightOwl] ANTHROPIC_API_KEY not set. Night Owl will be disabled.');
@@ -149,6 +154,50 @@ class NightOwlService {
     this.anthropic = this.anthropicApiKey ? new Anthropic({
       apiKey: this.anthropicApiKey
     }) : null;
+  }
+  
+  /**
+   * Check if processing is locked (with automatic timeout release)
+   */
+  isProcessingLocked() {
+    if (!this.isProcessing) return false;
+    
+    // Auto-release lock if it's been held too long (safeguard against stuck processes)
+    if (this.processingStartTime && (Date.now() - this.processingStartTime) > this.processingLockTimeout) {
+      console.warn('⚠️ [NightOwl] Processing lock timed out after 10 minutes - releasing');
+      this.isProcessing = false;
+      this.processingStartTime = null;
+      return false;
+    }
+    
+    return true;
+  }
+  
+  /**
+   * Acquire processing lock
+   * @returns {boolean} true if lock acquired, false if already locked
+   */
+  acquireProcessingLock() {
+    if (this.isProcessingLocked()) {
+      const elapsed = this.processingStartTime ? Math.round((Date.now() - this.processingStartTime) / 1000) : 0;
+      console.log(`🔒 [NightOwl] Processing already in progress (${elapsed}s elapsed) - blocking duplicate`);
+      return false;
+    }
+    
+    this.isProcessing = true;
+    this.processingStartTime = Date.now();
+    console.log('🔓 [NightOwl] Acquired processing lock');
+    return true;
+  }
+  
+  /**
+   * Release processing lock
+   */
+  releaseProcessingLock() {
+    const elapsed = this.processingStartTime ? Math.round((Date.now() - this.processingStartTime) / 1000) : 0;
+    this.isProcessing = false;
+    this.processingStartTime = null;
+    console.log(`🔓 [NightOwl] Released processing lock (was held for ${elapsed}s)`);
   }
 
   // ============================================================================
@@ -504,6 +553,17 @@ class NightOwlService {
       console.log('🦉 [NightOwl] Skipping - no API key configured');
       return { success: true, insightCount: 0, skipped: true, reason: 'no_api_key' };
     }
+    
+    // Prevent concurrent processing (multiple triggers = $$$)
+    if (!this.acquireProcessingLock()) {
+      return { 
+        success: false, 
+        insightCount: 0, 
+        skipped: true, 
+        reason: 'already_processing',
+        error: 'Night Owl is already processing. Please wait for the current run to complete.'
+      };
+    }
 
     console.log('🦉 [NightOwl] Starting nightly processing (2 AM batch)...');
     const startTime = Date.now();
@@ -522,19 +582,11 @@ class NightOwlService {
       allInsights.push(...queuedInsights);
 
       // ============================================================
-      // PHASE 2: AUTONOMOUS PROCESSING (only at 2 AM batch)
+      // PHASE 2: AUTONOMOUS PROCESSING - DISABLED TO SAVE COSTS
       // ============================================================
-      if (this.shouldRunAutonomous()) {
-        console.log('🦉 [NightOwl] Running autonomous processors...');
-
-        const remaining = this.settings.maxInsightsPerNight - allInsights.length;
-        if (remaining > 0) {
-          const autonomous = await this.runAutonomousProcessors(userContext, healthData, trackingData, remaining);
-          allInsights.push(...autonomous);
-        }
-      } else {
-        console.log('🦉 [NightOwl] Autonomous processing disabled. Skipping.');
-      }
+      // Autonomous "insights" disabled - they cost $$$ and don't add value
+      // Night Owl now only processes explicit research requests from queue
+      console.log('🦉 [NightOwl] Autonomous processing permanently disabled (cost savings).');
 
       // ============================================================
       // PHASE 3: SAVE & NOTIFY
@@ -565,6 +617,7 @@ class NightOwlService {
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
       console.log(`🦉 [NightOwl] Complete in ${elapsed}s. ${deduped.length} insights generated.`);
 
+      this.releaseProcessingLock();
       return {
         success: true,
         insightCount: deduped.length,
@@ -577,6 +630,7 @@ class NightOwlService {
 
     } catch (error) {
       console.error('❌ [NightOwl] Processing failed:', error);
+      this.releaseProcessingLock();
       return { success: false, error: error.message, insightCount: allInsights.length };
     }
   }
@@ -591,6 +645,17 @@ class NightOwlService {
     if (!this.anthropic) {
       console.log('🦉 [NightOwl] Skipping - no API key configured');
       return { success: true, insightCount: 0, skipped: true, reason: 'no_api_key' };
+    }
+    
+    // Prevent concurrent processing (multiple triggers = $$$)
+    if (!this.acquireProcessingLock()) {
+      return { 
+        success: false, 
+        insightCount: 0, 
+        skipped: true, 
+        reason: 'already_processing',
+        error: 'Night Owl is already processing. Please wait for the current run to complete.'
+      };
     }
 
     console.log('🦉 [NightOwl] Processing queued requests only (on-demand)...');
@@ -613,6 +678,7 @@ class NightOwlService {
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(1);
       console.log(`🦉 [NightOwl] Queued processing complete in ${elapsed}s. ${queuedInsights.length} insights generated.`);
 
+      this.releaseProcessingLock();
       return {
         success: true,
         insightCount: queuedInsights.length,
@@ -625,6 +691,7 @@ class NightOwlService {
 
     } catch (error) {
       console.error('❌ [NightOwl] Queued processing failed:', error);
+      this.releaseProcessingLock();
       return { success: false, error: error.message, insightCount: 0 };
     }
   }
@@ -1851,36 +1918,42 @@ Think through this situation and offer something useful.`;
 
   /**
    * Research depth configurations
-   * - quick: Fast surface-level research (~30s, ~$0.10)
-   * - standard: Balanced depth and speed (~2min, ~$0.30)  
-   * - deep: Thorough multi-iteration research (~10min, ~$1.50)
+   * REDUCED COSTS - was burning $$$
+   * - quick: Fast surface-level research (~15s, ~$0.05)
+   * - standard: Single-pass research (~30s, ~$0.10)  
+   * - deep: Two iterations max (~1min, ~$0.25)
    */
   static RESEARCH_DEPTH_CONFIGS = {
     quick: {
       maxIterations: 1,
-      maxSubQuestions: 3,
-      maxSearchesPerIteration: 2,
+      maxSubQuestions: 2,
+      maxSearchesPerIteration: 1,
       synthesisDepth: 'brief'
     },
     standard: {
-      maxIterations: 3,
-      maxSubQuestions: 5,
-      maxSearchesPerIteration: 3,
+      maxIterations: 1,  // Was 3 - too expensive
+      maxSubQuestions: 3,  // Was 5
+      maxSearchesPerIteration: 2,  // Was 3
       synthesisDepth: 'thorough'
     },
     deep: {
-      maxIterations: 8,
-      maxSubQuestions: 8,
-      maxSearchesPerIteration: 5,
+      maxIterations: 2,  // Was 8 - way too expensive!
+      maxSubQuestions: 4,  // Was 8
+      maxSearchesPerIteration: 2,  // Was 5
       synthesisDepth: 'comprehensive',
-      enableRecursiveSubtopics: true,
-      minCompletenessThreshold: 0.9
+      enableRecursiveSubtopics: false,  // Was true - recursive = $$$
+      minCompletenessThreshold: 0.7  // Was 0.9 - too aggressive
     }
   };
 
   async doResearch(loop, userContext, depth = 'standard') {
     const depthConfig = NightOwlService.RESEARCH_DEPTH_CONFIGS[depth] || NightOwlService.RESEARCH_DEPTH_CONFIGS.standard;
-    console.log(`🔍 [NightOwl] Starting ${depth} research: "${loop.title}" (max ${depthConfig.maxIterations} iterations)`);
+    
+    // Cost estimation for logging
+    const estimatedCalls = depthConfig.maxIterations * depthConfig.maxSubQuestions;
+    const estimatedCost = (estimatedCalls * 0.03).toFixed(2); // ~$0.03 per call with web search
+    console.log(`🔍 [NightOwl] Starting ${depth} research: "${loop.title}"`);
+    console.log(`💰 [NightOwl] Estimated: ${estimatedCalls} API calls (~$${estimatedCost})`);
 
     const config = {
       maxIterations: depthConfig.maxIterations,
