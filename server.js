@@ -67,20 +67,24 @@ class TaskNotificationServer {
   }
 
   saveDeviceToken(token, userId = 'default') {
-    if (!this.deviceTokens.find(t => t.token === token)) {
+    const existing = this.deviceTokens.find(t => t.token === token);
+    if (existing) {
+      console.log(`📱 Device token already registered for ${existing.userId} (re-registered by ${userId})`);
+      existing.registeredAt = Date.now();
+      existing.userId = userId;
+    } else {
       this.deviceTokens.push({
         token,
         userId,
         registeredAt: Date.now()
       });
-      
-      fs.writeFileSync(
-        DEVICE_TOKENS_FILE,
-        JSON.stringify(this.deviceTokens, null, 2)
-      );
-      
-      console.log(`📱 Registered device token for user ${userId}`);
+      console.log(`📱 NEW device token registered for user ${userId}: ${token.substring(0, 10)}...`);
     }
+
+    fs.writeFileSync(
+      DEVICE_TOKENS_FILE,
+      JSON.stringify(this.deviceTokens, null, 2)
+    );
   }
 
   loadTasks() {
@@ -1345,11 +1349,21 @@ app.get('/health', (req, res) => {
   });
 });
 
-// Debug endpoint to manually add test token
+// Debug endpoint - logs push registration status from frontend
 app.post('/debug-register', (req, res) => {
-  const testToken = 'AA2B1A111CA14C6DCA9CF9F0916820CA31067143D5148E7C0E260CFBD3839CBC';
-  server.registerDevice(testToken, 'debug-user');
-  res.json({ success: true, message: 'Debug token registered', token: testToken });
+  console.log('🔍 [DEBUG-REGISTER]', JSON.stringify(req.body));
+  if (req.body.token) {
+    server.saveDeviceToken(req.body.token, req.body.userId || 'debug');
+  }
+  res.json({ success: true, received: req.body });
+});
+
+// Clear all device tokens (for debugging stale tokens)
+app.post('/clear-tokens', (req, res) => {
+  server.deviceTokens = [];
+  fs.writeFileSync(DEVICE_TOKENS_FILE, JSON.stringify([], null, 2));
+  console.log('🗑️ All device tokens cleared');
+  res.json({ success: true, message: 'All device tokens cleared' });
 });
 
 // Cleanup endpoint to remove duplicate marriage tasks
