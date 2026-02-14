@@ -1201,14 +1201,20 @@ app.post('/send-notification', async (req, res) => {
   const tokens = deviceToken ? [deviceToken] : server.deviceTokens.map(d => d.token);
   
   try {
+    const results = [];
     for (const token of tokens) {
-      await apnProvider.send(notification, token);
+      const result = await apnProvider.send(notification, token);
+      results.push({
+        token: token.substring(0, 10) + '...',
+        sent: result.sent?.length || 0,
+        failed: result.failed?.map(f => ({ status: f.status, response: f.response })) || []
+      });
     }
-    console.log(`📤 Sent custom notification: "${title}"`);
-    res.json({ success: true, message: 'Notification sent' });
+    console.log(`📤 Sent custom notification: "${title}"`, JSON.stringify(results));
+    res.json({ success: true, message: 'Notification sent', results });
   } catch (error) {
     console.error('Error sending custom notification:', error);
-    res.status(500).json({ error: 'Failed to send notification' });
+    res.status(500).json({ error: 'Failed to send notification', details: error.message });
   }
 });
 
