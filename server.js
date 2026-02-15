@@ -1276,6 +1276,16 @@ app.post('/cancel-reminder', (req, res) => {
   res.json({ success: true, message: 'Reminder cancelled' });
 });
 
+// Cancel all unsent reminders (used by client before re-scheduling)
+app.post('/cancel-all-reminders', (req, res) => {
+  const reminders = server.loadReminders();
+  const kept = reminders.filter(r => r.sent);
+  const cancelled = reminders.length - kept.length;
+  server.saveReminders(kept);
+  console.log(`❌ Cancelled ${cancelled} pending reminders`);
+  res.json({ success: true, cancelled });
+});
+
 // Get all scheduled reminders
 app.get('/reminders', (req, res) => {
   const reminders = server.loadReminders();
