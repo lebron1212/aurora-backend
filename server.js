@@ -1240,10 +1240,18 @@ app.post('/schedule-reminder', (req, res) => {
     createdAt: Date.now(),
     sent: false
   };
-  
+
   const reminders = server.loadReminders();
-  reminders.push(reminder);
-  server.saveReminders(reminders);
+  // Deduplicate: remove any existing unsent reminder with the same title
+  // scheduled for the same calendar day (prevents accumulation on failed cancels)
+  const scheduledDay = new Date(reminder.scheduledFor).toDateString();
+  const deduped = reminders.filter(r => {
+    if (r.sent) return true;
+    if (r.title === title && new Date(r.scheduledFor).toDateString() === scheduledDay) return false;
+    return true;
+  });
+  deduped.push(reminder);
+  server.saveReminders(deduped);
   
   const scheduledDate = new Date(reminder.scheduledFor);
   console.log(`📅 Scheduled reminder "${title}" for ${scheduledDate.toISOString()}`);
