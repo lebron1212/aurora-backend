@@ -150,36 +150,39 @@ class TaskNotificationServer {
     const reminders = this.loadReminders();
     const now = Date.now();
     const pendingReminders = [];
-    
+    let anySent = false;
+
     for (const reminder of reminders) {
       if (reminder.scheduledFor <= now && !reminder.sent) {
         console.log(`🔔 Sending scheduled reminder: "${reminder.title}"`);
-        
+
         const notification = new apn.Notification();
         notification.alert = { title: reminder.title, body: reminder.body };
         notification.sound = reminder.sound || 'default';
         notification.badge = 1;
         notification.topic = 'com.aurora.es.app';
         notification.payload = reminder.payload || {};
-        
+
         try {
           for (const device of this.deviceTokens) {
             await apnProvider.send(notification, device.token);
           }
           reminder.sent = true;
           reminder.sentAt = now;
+          anySent = true;
         } catch (error) {
           console.error('Error sending reminder:', error);
         }
       }
-      
+
       // Keep reminders that are still pending or were sent in the last 24 hours (for history)
       if (!reminder.sent || (now - reminder.sentAt < 24 * 60 * 60 * 1000)) {
         pendingReminders.push(reminder);
       }
     }
-    
-    if (pendingReminders.length !== reminders.length) {
+
+    // Always save when reminders were sent (to persist sent flag) or pruned
+    if (anySent || pendingReminders.length !== reminders.length) {
       this.saveReminders(pendingReminders);
     }
   }
